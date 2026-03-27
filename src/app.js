@@ -23,6 +23,8 @@ import { loadDataFromFile } from './data/sampleData.js';
 import MovingAverageStrategy from './strategies/movingAverageStrategy.js';
 import RSIMeanReversionStrategy from './strategies/rsiMeanReversionStrategy.js';
 import BreakoutStrategy from './strategies/breakoutStrategy.js';
+import MACDTrendStrategy from './strategies/macdTrendStrategy.js';
+import VWAPMeanReversionStrategy from './strategies/vwapMeanReversionStrategy.js';
 import riskManager from './risk/riskManager.js';
 import OrderManager from './execution/orderManager.js';
 import PaperBroker from './brokers/paperBroker.js';
@@ -142,6 +144,29 @@ function initializeStrategies() {
     app.strategies.push(
       new BreakoutStrategy({
         lookbackPeriod: strategyConfigs.breakout.lookbackPeriod,
+      })
+    );
+  }
+
+  // MACD Trend Strategy (NEW - default enabled)
+  if (strategyConfigs.macdTrend.enabled) {
+    app.strategies.push(
+      new MACDTrendStrategy({
+        fastPeriod: strategyConfigs.macdTrend.fastPeriod,
+        slowPeriod: strategyConfigs.macdTrend.slowPeriod,
+        signalPeriod: strategyConfigs.macdTrend.signalPeriod,
+        adxThreshold: strategyConfigs.macdTrend.adxThreshold,
+      })
+    );
+  }
+
+  // VWAP Mean Reversion Strategy (NEW - default enabled)
+  if (strategyConfigs.vwapMeanReversion.enabled) {
+    app.strategies.push(
+      new VWAPMeanReversionStrategy({
+        bbPeriod: strategyConfigs.vwapMeanReversion.bbPeriod,
+        stdDev: strategyConfigs.vwapMeanReversion.stdDev,
+        rsiPeriod: strategyConfigs.vwapMeanReversion.rsiPeriod,
       })
     );
   }

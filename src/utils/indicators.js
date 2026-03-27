@@ -151,10 +151,18 @@ export function macd(prices, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9)
 
   const macdLine = fastEma - slowEma;
 
-  // Calculate signal line (EMA of MACD line)
-  // For simplicity, we'll use a simplified approach
-  // In production, you'd calculate this properly over historical MACD values
-  const signalLine = macdLine * 0.1; // Simplified placeholder
+  // Build historical MACD values to calculate proper signal line
+  const macdHistory = [];
+  for (let i = slowPeriod; i < prices.length; i++) {
+    const fast = ema(prices.slice(0, i + 1), fastPeriod);
+    const slow = ema(prices.slice(0, i + 1), slowPeriod);
+    if (fast && slow) {
+      macdHistory.push(fast - slow);
+    }
+  }
+
+  // Calculate signal line (EMA of MACD)
+  const signalLine = sma(macdHistory, signalPeriod) || macdLine;
   const histogram = macdLine - signalLine;
 
   return { macd: macdLine, signal: signalLine, histogram };
@@ -213,6 +221,72 @@ export function lowestLow(candles, period) {
 }
 
 /**
+ * Calculate highest low over a period
+ */
+export function highestLow(candles, period) {
+  if (!candles || candles.length < period) return null;
+  const slice = candles.slice(-period);
+  return Math.max(...slice.map(c => c.low));
+}
+
+/**
+ * Calculate VWAP (Volume Weighted Average Price)
+ * @param {Object[]} candles - Array of OHLCV candles
+ * @param {number} resetTime - Reset time in seconds (default: 86400 = 1 day)
+ * @returns {number|null} VWAP value or null
+ */
+export function vwap(candles, resetTime = 86400) {
+  if (!candles || candles.length === 0) return null;
+
+  let totalTyp = 0; // Total Typical Price * Volume
+  let totalVolume = 0;
+
+  const now = Date.now();
+  const resetTimestamp = now - (resetTime * 1000);
+
+  // Filter candles within current reset period
+  const periodCandles = candles.filter(c => c.timestamp >= resetTimestamp);
+
+  if (periodCandles.length === 0) return null;
+
+  for (const candle of periodCandles) {
+    const typicalPrice = (candle.open + candle.high + candle.low) / 3;
+    totalTyp += typicalPrice * candle.volume;
+    totalVolume += candle.volume;
+  }
+
+  if (totalVolume === 0) return null;
+
+  return totalTyp / totalVolume;
+}
+
+/**
+ * Get VWAP bands (upper/lower) for mean reversion
+ */
+export function vwapBands(candles, period = 20, stdDev = 2, resetTime = 86400) {
+  const vwap = vwap(candles, resetTime);
+  if (!vwap) return null;
+
+  // Calculate price deviations from VWAP
+  const deviations = candles
+    .filter(c => c.timestamp >= candles[candles.length - 1].timestamp - resetTime)
+    .map(c => c.close - vwap);
+
+  if (deviations.length < period) return null;
+
+  const avgDev = sma(deviations, period);
+  const squaredDiffs = deviations.slice(-period).map(d => Math.pow(d - avgDev, 2));
+  const variance = squaredDiffs.reduce((a, b) => a + b, 0) / period;
+  const standardDeviation = Math.sqrt(variance);
+
+  return {
+    vwap,
+    upper: vwap + (stdDev * standardDeviation),
+    lower: vwap - (stdDev * standardDeviation),
+  };
+}
+
+/**
  * Average Directional Index (ADX)
  * Simplified implementation
  */
@@ -264,5 +338,8 @@ export default {
   stochastic,
   highestHigh,
   lowestLow,
+  highestLow,
+  vwap,
+  vwapBands,
   adx,
 };

@@ -46,6 +46,23 @@ const defaultConfig = {
       enabled: true,
       lookbackPeriod: 20,
     },
+    // MACD Trend Strategy (NEW - trend-following with histogram divergence)
+    macdTrend: {
+      enabled: true,
+      fastPeriod: 12,
+      slowPeriod: 26,
+      signalPeriod: 9,
+      adxThreshold: 25,
+      useADXFilter: true,
+    },
+    // VWAP Mean Reversion Strategy (NEW - volume-based mean reversion)
+    vwapMeanReversion: {
+      enabled: true,
+      bbPeriod: 20,
+      stdDev: 2,
+      rsiPeriod: 14,
+      resetTime: 86400,
+    },
   },
 
   // Risk management

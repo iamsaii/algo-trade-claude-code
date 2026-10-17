@@ -247,6 +247,28 @@ test('OrderManager mirrors broker positions and PnL', async () => {
   );
 });
 
+test('PositionMonitor closes via the broker on stop-loss', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+  const mon = new PositionMonitor(om);
+  mon.start();
+
+  const o = om.createOrder(
+    { symbol: 'Z', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' },
+    10
+  );
+  await om.executeOrder(o.id);
+  assert(om.getPositions().length === 1, 'should be open before the stop is hit');
+
+  eventBus.emitSafe('market_tick', { symbol: 'Z', price: 94, timestamp: Date.now() });
+  await new Promise(r => setTimeout(r, 50));
+
+  assert(om.getPositions().length === 0, 'order manager should be flat');
+  assert((await b.getPositions()).length === 0, 'broker should be flat');
+  mon.stop();
+});
+
 // Test runner behaviour
 logger.info('\n=== Testing Test Runner ===\n');
 

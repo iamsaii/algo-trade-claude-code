@@ -133,6 +133,9 @@ async function initializeBroker(mode, { dryRun = false } = {}) {
     app.orderManager = new OrderManager(app.broker);
     // P1-4: monitor open positions for stop-loss / target hits.
     app.positionMonitor = new PositionMonitor(app.orderManager);
+    // The broker is authoritative for positions, so seed the mirror at startup.
+    // On a mid-session restart against a real broker this recovers open positions.
+    await app.orderManager.syncPositions();
   }
 
   logger.info(`Broker initialized: ${app.broker?.name || 'N/A'}`);

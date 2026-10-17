@@ -87,7 +87,7 @@ class PaperBroker extends BaseBroker {
     const actualQuantity = order.quantity;
 
     // Update position + margin/balance. This is where cash actually moves.
-    this._updatePosition(order.side, order.symbol, fillPrice, actualQuantity);
+    const effect = this._updatePosition(order.side, order.symbol, fillPrice, actualQuantity);
 
     // Store order
     const filledOrder = {
@@ -114,6 +114,9 @@ class PaperBroker extends BaseBroker {
       fillPrice,
       quantity: actualQuantity,
       orderId: order.id,
+      action: effect.action,
+      realizedPnL: effect.realizedPnL,
+      closedQuantity: effect.closedQuantity,
     };
   }
 
@@ -145,21 +148,40 @@ class PaperBroker extends BaseBroker {
   /**
    * Update position after an order fill. Routes to open (add) or close based
    * on the incoming side versus any existing position, and handles flips.
+   * Returns the fill effect: { action, realizedPnL, closedQuantity }.
+   *   action = OPEN | ADD | REDUCE | CLOSE | FLIP
    */
   _updatePosition(side, symbol, price, quantity) {
     const existing = this.positions.get(symbol);
 
-    if (existing && existing.side !== side) {
-      // Opposite side -> reduce/close, then open the remainder (if any).
-      const closed = this._closePosition(symbol, price, quantity);
-      const remainder = quantity - (closed?.quantity || 0);
-      if (remainder > 0) {
-        this._addToPosition(symbol, side, price, remainder);
-      }
-      return;
+    if (!existing) {
+      this._addToPosition(symbol, side, price, quantity);
+      return { action: 'OPEN', realizedPnL: 0, closedQuantity: 0 };
     }
 
-    this._addToPosition(symbol, side, price, quantity);
+    if (existing.side === side) {
+      this._addToPosition(symbol, side, price, quantity);
+      return { action: 'ADD', realizedPnL: 0, closedQuantity: 0 };
+    }
+
+    // Opposite side -> reduce/close, then open the remainder (if any).
+    const existingQuantity = existing.quantity;
+    const closed = this._closePosition(symbol, price, quantity);
+    const closedQuantity = closed?.quantity || 0;
+    const realizedPnL = closed?.pnl || 0;
+    const remainder = quantity - closedQuantity;
+
+    if (remainder > 0) {
+      // Order was larger than the position: flip to the opposite side.
+      this._addToPosition(symbol, side, price, remainder);
+      return { action: 'FLIP', realizedPnL, closedQuantity };
+    }
+
+    return {
+      action: closedQuantity < existingQuantity ? 'REDUCE' : 'CLOSE',
+      realizedPnL,
+      closedQuantity,
+    };
   }
 
   /**

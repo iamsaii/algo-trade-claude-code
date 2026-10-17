@@ -200,6 +200,25 @@ test('PaperBroker exposes normalized positions', async () => {
   assert((await b.getPosition('NOPE')) === null, 'expected null when flat');
 });
 
+test('PaperBroker reports fill effect and realized PnL', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  await b.placeOrder({ id: 'o1', symbol: 'X', side: 'BUY', quantity: 10, entryPrice: 100 });
+
+  const r1 = await b.placeOrder({ id: 'o2', symbol: 'X', side: 'SELL', quantity: 4, entryPrice: 110 });
+  assert(r1.action === 'REDUCE' && r1.closedQuantity === 4, `expected REDUCE/4, got ${r1.action}/${r1.closedQuantity}`);
+  assert(Math.abs(r1.realizedPnL - 40) < 1e-9, `expected pnl 40, got ${r1.realizedPnL}`);
+  assert((await b.getPosition('X')).quantity === 6, 'remaining qty should be 6');
+
+  const r2 = await b.placeOrder({ id: 'o3', symbol: 'X', side: 'SELL', quantity: 6, entryPrice: 90 });
+  assert(r2.action === 'CLOSE', `expected CLOSE, got ${r2.action}`);
+  assert(Math.abs(r2.realizedPnL - (-60)) < 1e-9, `expected pnl -60, got ${r2.realizedPnL}`);
+  assert((await b.getPosition('X')) === null, 'should be flat');
+
+  const r3 = await b.placeOrder({ id: 'o4', symbol: 'X', side: 'SELL', quantity: 5, entryPrice: 100 });
+  assert(r3.action === 'OPEN', `expected OPEN, got ${r3.action}`);
+});
+
 // Test runner behaviour
 logger.info('\n=== Testing Test Runner ===\n');
 

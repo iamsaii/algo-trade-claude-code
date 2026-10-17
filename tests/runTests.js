@@ -11,6 +11,11 @@ import BreakoutStrategy from '../src/strategies/breakoutStrategy.js';
 import Backtester from '../src/backtest/backtester.js';
 import { loadDataFromFile } from '../src/data/sampleData.js';
 import { calculatePerformanceMetrics } from '../src/backtest/performance.js';
+import PaperBroker from '../src/brokers/paperBroker.js';
+import OrderManager from '../src/execution/orderManager.js';
+import PositionMonitor from '../src/execution/positionMonitor.js';
+import config from '../src/core/config.js';
+import { eventBus } from '../src/core/eventBus.js';
 
 let passed = 0;
 let failed = 0;
@@ -171,6 +176,28 @@ test('Performance metrics calculates correctly', () => {
   });
   assert(metrics.winRate !== undefined, 'No win rate');
   assert(metrics.totalReturnPercent !== undefined, 'No return');
+});
+
+// Test Broker Ledger
+logger.info('\n=== Testing Broker Ledger ===\n');
+
+// Deterministic fills for ledger tests.
+config.set('paperTrading.simulateDelay', false);
+config.set('paperTrading.simulateSlippage', false);
+
+test('PaperBroker exposes normalized positions', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  await b.placeOrder({ id: 'o1', symbol: 'RELIANCE', side: 'BUY', quantity: 10, entryPrice: 2500 });
+
+  const list = await b.getPositions();
+  assert(list.length === 1, `expected 1 position, got ${list.length}`);
+  assert(list[0].symbol === 'RELIANCE' && list[0].side === 'BUY', 'wrong symbol/side');
+  assert(list[0].quantity === 10 && list[0].avgPrice === 2500, `wrong qty/avg: ${JSON.stringify(list[0])}`);
+
+  const one = await b.getPosition('RELIANCE');
+  assert(one && one.quantity === 10, 'getPosition returned wrong position');
+  assert((await b.getPosition('NOPE')) === null, 'expected null when flat');
 });
 
 // Test runner behaviour

@@ -47,7 +47,18 @@ class BaseBroker extends EventEmitter {
   }
 
   /**
-   * Get current position for a symbol - must be implemented by subclass
+   * Get all open positions - must be implemented by subclass.
+   * Contract: returns NormalizedPosition[] where each is
+   *   { symbol, side:'BUY'|'SELL', quantity, avgPrice, currentPrice, unrealizedPnL }
+   * Flat rows (quantity <= 0) must be omitted.
+   */
+  async getPositions() {
+    throw new Error('getPositions() must be implemented by subclass');
+  }
+
+  /**
+   * Get current position for a symbol - must be implemented by subclass.
+   * Returns the normalized shape above, or null when flat.
    */
   async getPosition(symbol) {
     throw new Error('getPosition() must be implemented by subclass');

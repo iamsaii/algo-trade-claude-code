@@ -251,10 +251,33 @@ class PaperBroker extends BaseBroker {
   }
 
   /**
-   * Get position for a symbol
+   * Get all open positions in the normalized broker shape.
+   * Contract: { symbol, side, quantity, avgPrice, currentPrice, unrealizedPnL }
+   */
+  async getPositions() {
+    return Array.from(this.positions.values())
+      .filter(p => p.quantity > 0)
+      .map(p => this._normalizePosition(p));
+  }
+
+  /**
+   * Get position for a symbol (normalized), or null when flat.
    */
   async getPosition(symbol) {
-    return this.positions.get(symbol) || null;
+    const position = this.positions.get(symbol);
+    if (!position || position.quantity <= 0) return null;
+    return this._normalizePosition(position);
+  }
+
+  _normalizePosition(p) {
+    return {
+      symbol: p.symbol,
+      side: p.side,
+      quantity: p.quantity,
+      avgPrice: p.avgPrice,
+      currentPrice: p.currentPrice,
+      unrealizedPnL: p.unrealizedPnL,
+    };
   }
 
   /**
@@ -274,7 +297,7 @@ class PaperBroker extends BaseBroker {
    * Get all holdings/positions
    */
   async getHoldings() {
-    return Array.from(this.positions.values());
+    return this.getPositions();
   }
 
   /**

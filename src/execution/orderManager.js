@@ -152,41 +152,35 @@ class OrderManager extends EventEmitter {
     // Add to history
     this.orderHistory.push(order);
 
-    // Update position
-    this._updatePosition(order);
+    // Update position (a closing fill settles the existing trade record).
+    const update = this._updatePosition(order);
 
-    // Create trade record
-    const trade = {
-      id: generateOrderId().replace('ORD', 'TRD'),
-      orderId: order.id,
-      symbol: order.symbol,
-      side: order.side,
-      quantity: order.quantity,
-      entryPrice: fillPrice,
-      exitPrice: null,
-      stopLoss: order.stopLoss,
-      target: order.target,
-      strategy: order.strategy,
-      pnl: 0,
-      status: 'OPEN',
-      timestamp: Date.now(),
-    };
-    this.tradeHistory.push(trade);
-    this.totalTrades++;
+    // Maintain exactly one OPEN trade record per open position.
+    const { trade, opened } = this._recordFill(order, fillPrice, quantity, update);
 
-    logger.trade({
-      action: order.side,
-      symbol: order.symbol,
-      quantity: order.quantity,
-      entryPrice: fillPrice,
-      strategy: order.strategy,
-    });
+    if (trade) {
+      logger.trade({
+        action: order.side,
+        symbol: order.symbol,
+        quantity: order.quantity,
+        entryPrice: fillPrice,
+        strategy: order.strategy,
+      });
+    } else {
+      logger.debug('Closing fill settled existing position', {
+        symbol: order.symbol,
+        orderId: order.id,
+      });
+    }
 
-    // Emit events
-    eventBus.emitSafe('order_filled', {
-      ...trade,
-      entryPrice: fillPrice,
-    });
+    // Emit only for newly opened positions; closes emit position_closed.
+    if (opened && trade) {
+      this.totalTrades++;
+      eventBus.emitSafe('order_filled', {
+        ...trade,
+        entryPrice: fillPrice,
+      });
+    }
 
     return { success: true, order, trade };
   }
@@ -214,31 +208,73 @@ class OrderManager extends EventEmitter {
    * Update position after order fill
    */
   _updatePosition(order) {
-    const existingPosition = this.positions.get(order.symbol);
+    const existing = this.positions.get(order.symbol);
 
-    if (order.side === 'BUY') {
-      if (existingPosition && existingPosition.side === 'SELL') {
-        // Closing short position
-        this._closePosition(order.symbol, order.fillPrice, order.quantity);
-      } else {
-        // Opening or adding to long position
-        this._openOrAddPosition(order.symbol, 'BUY', order.fillPrice, order.quantity);
+    if (existing && existing.side !== order.side) {
+      // Opposite side -> reduce/close, then open the remainder (if any).
+      if (order.reason) existing.exitReason = order.reason;
+      const closed = this._closePosition(order.symbol, order.fillPrice, order.quantity);
+      const remainder = order.quantity - (closed?.quantity || 0);
+      let opened = false;
+      if (remainder > 0) {
+        this._openOrAddPosition(order.symbol, order.side, order.fillPrice, remainder, order);
+        opened = true;
       }
-    } else {
-      if (existingPosition && existingPosition.side === 'BUY') {
-        // Closing long position
-        this._closePosition(order.symbol, order.fillPrice, order.quantity);
-      } else {
-        // Opening or adding to short position
-        this._openOrAddPosition(order.symbol, 'SELL', order.fillPrice, order.quantity);
-      }
+      return { closed: !!closed, opened };
     }
+
+    this._openOrAddPosition(order.symbol, order.side, order.fillPrice, order.quantity, order);
+    return { closed: false, opened: true };
+  }
+
+  /**
+   * Maintain exactly one OPEN trade record per open position.
+   * A pure closing fill has no new trade record (the close event settles it).
+   * Returns { trade, opened } - trade is null for a pure close.
+   */
+  _recordFill(order, fillPrice, quantity, update = {}) {
+    const symbol = order.symbol;
+
+    if (update.closed && !update.opened) {
+      return { trade: null, opened: false };
+    }
+
+    const existing = this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
+
+    if (existing && existing.side === order.side) {
+      // Increase: roll into the existing open trade instead of duplicating it.
+      const totalQuantity = existing.quantity + quantity;
+      existing.entryPrice = (existing.entryPrice * existing.quantity + fillPrice * quantity) / totalQuantity;
+      existing.quantity = totalQuantity;
+      existing.orderId = order.id;
+      if (order.stopLoss != null) existing.stopLoss = order.stopLoss;
+      if (order.target != null) existing.target = order.target;
+      return { trade: existing, opened: false };
+    }
+
+    const trade = {
+      id: generateOrderId().replace('ORD', 'TRD'),
+      orderId: order.id,
+      symbol,
+      side: order.side,
+      quantity,
+      entryPrice: fillPrice,
+      exitPrice: null,
+      stopLoss: order.stopLoss,
+      target: order.target,
+      strategy: order.strategy,
+      pnl: 0,
+      status: 'OPEN',
+      timestamp: Date.now(),
+    };
+    this.tradeHistory.push(trade);
+    return { trade, opened: true };
   }
 
   /**
    * Open or add to position
    */
-  _openOrAddPosition(symbol, side, price, quantity) {
+  _openOrAddPosition(symbol, side, price, quantity, order = {}) {
     const existing = this.positions.get(symbol);
 
     if (existing) {
@@ -247,8 +283,12 @@ class OrderManager extends EventEmitter {
       const totalQuantity = existing.quantity + quantity;
       existing.avgPrice = totalValue / totalQuantity;
       existing.quantity = totalQuantity;
+      if (order.id) existing.orderId = order.id;
+      if (order.stopLoss != null) existing.stopLoss = order.stopLoss;
+      if (order.target != null) existing.target = order.target;
     } else {
-      // New position
+      // New position - keep the protective levels and metadata so the
+      // position monitor and exits can act on it later.
       this.positions.set(symbol, {
         symbol,
         side,
@@ -257,6 +297,11 @@ class OrderManager extends EventEmitter {
         currentPrice: price,
         unrealizedPnL: 0,
         openedAt: Date.now(),
+        orderId: order.id || null,
+        stopLoss: order.stopLoss ?? null,
+        target: order.target ?? null,
+        strategy: order.strategy || 'unknown',
+        exiting: false,
       });
     }
 
@@ -292,13 +337,18 @@ class OrderManager extends EventEmitter {
       this.positions.delete(symbol);
     }
 
-    // Update the trade record
-    const openTrade = this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
+    // Match this close to the open trade it belongs to (by originating order first).
+    const openTrade = this.tradeHistory.find(t =>
+      t.status === 'OPEN' &&
+      (position.orderId ? t.orderId === position.orderId : t.symbol === symbol)
+    ) || this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
+
     if (openTrade) {
       openTrade.exitPrice = exitPrice;
       openTrade.pnl = pnl;
       openTrade.status = 'CLOSED';
       openTrade.closedAt = Date.now();
+      openTrade.exitReason = position.exitReason;
     }
 
     logger.info('Position closed', {
@@ -308,8 +358,9 @@ class OrderManager extends EventEmitter {
       pnl,
     });
 
-    // Emit event
+    // Emit event - includes tradeId so the risk manager can settle correctly.
     eventBus.emitSafe('position_closed', {
+      tradeId: openTrade?.id || null,
       symbol,
       quantity: quantityToClose,
       exitPrice,
@@ -317,6 +368,43 @@ class OrderManager extends EventEmitter {
     });
 
     return { pnl, quantity: quantityToClose };
+  }
+
+  /**
+   * Close a position by sending the opposite order to the broker, so that the
+   * broker's cash ledger and the order manager's ledger stay in sync.
+   */
+  async closePositionViaBroker(symbol, exitPrice, reason = 'Exit') {
+    const position = this.positions.get(symbol);
+    if (!position || position.exiting) return null;
+
+    // Guard against double-triggering from rapid ticks before the fill lands.
+    position.exiting = true;
+    position.exitReason = reason;
+
+    const signal = {
+      symbol,
+      action: position.side === 'BUY' ? 'SELL' : 'BUY',
+      entryPrice: exitPrice,
+      stopLoss: exitPrice,
+      target: exitPrice,
+      strategy: position.strategy || 'Exit',
+      reason,
+    };
+
+    const order = this.createOrder(signal, position.quantity);
+    if (!order) {
+      position.exiting = false;
+      return null;
+    }
+
+    const result = await this.executeOrder(order.id);
+    if (!result || !result.success) {
+      // Still open (or not found) - allow a future attempt.
+      const stillOpen = this.positions.get(symbol);
+      if (stillOpen) stillOpen.exiting = false;
+    }
+    return result;
   }
 
   /**
@@ -390,8 +478,9 @@ class OrderManager extends EventEmitter {
    * Get statistics
    */
   getStats() {
-    const winRate = this.totalTrades > 0
-      ? (this.winningTrades / this.totalTrades) * 100
+    const closedTrades = this.winningTrades + this.losingTrades;
+    const winRate = closedTrades > 0
+      ? (this.winningTrades / closedTrades) * 100
       : 0;
 
     return {
@@ -413,10 +502,13 @@ class OrderManager extends EventEmitter {
   async closeAllPositions(currentPrices) {
     const results = [];
 
-    for (const [symbol, position] of this.positions) {
+    // Snapshot keys: closing mutates this.positions.
+    for (const [symbol, position] of [...this.positions]) {
       const price = currentPrices[symbol] || position.currentPrice;
-      const result = this._closePosition(symbol, price, position.quantity);
-      results.push({ symbol, ...result });
+      const result = await this.closePositionViaBroker(symbol, price, 'Shutdown');
+      if (result?.success) {
+        results.push({ symbol, pnl: result?.trade?.pnl ?? 0 });
+      }
     }
 
     return results;

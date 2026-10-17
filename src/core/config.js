@@ -27,6 +27,12 @@ const defaultConfig = {
     tickIntervalMs: 1000,          // Simulated tick frequency
     candleIntervalMinutes: 5,      // Candle timeframe
     symbols: ['RELIANCE', 'INFY', 'HDFCBANK', 'TCS', 'ICICIBANK'],
+    // A real market-data feed. Disabled by default: when false, `--mode live`
+    // refuses to start rather than price real orders off the simulator.
+    liveFeed: {
+      enabled: false,
+      url: null,
+    },
   },
 
   // Strategy settings

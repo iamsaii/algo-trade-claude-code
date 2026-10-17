@@ -27,6 +27,7 @@ import MACDTrendStrategy from './strategies/macdTrendStrategy.js';
 import VWAPMeanReversionStrategy from './strategies/vwapMeanReversionStrategy.js';
 import riskManager from './risk/riskManager.js';
 import OrderManager from './execution/orderManager.js';
+import PositionMonitor from './execution/positionMonitor.js';
 import PaperBroker from './brokers/paperBroker.js';
 import KiteBroker from './brokers/kiteBroker.js';
 import tradeRepository from './storage/tradeRepository.js';
@@ -40,6 +41,7 @@ const app = {
   strategies: [],
   broker: null,
   orderManager: null,
+  positionMonitor: null,
   symbols: [],
   historicalData: new Map(),
 };
@@ -47,13 +49,13 @@ const app = {
 /**
  * Initialize the application
  */
-async function initialize(mode) {
+async function initialize(mode, options = {}) {
   app.mode = mode;
   app.symbols = config.get('market.symbols');
 
   logger.info('='.repeat(50));
   logger.info('Algo-Trading Framework Starting');
-  logger.info(`Mode: ${chalk.bold(mode.toUpperCase())}`);
+  logger.info(`Mode: ${chalk.bold(mode.toUpperCase())}${options.dryRun ? chalk.yellow(' (dry-run)') : ''}`);
   logger.info('='.repeat(50));
 
   // Initialize database
@@ -62,7 +64,7 @@ async function initialize(mode) {
   }
 
   // Initialize broker based on mode
-  await initializeBroker(mode);
+  await initializeBroker(mode, options);
 
   // Initialize strategies
   initializeStrategies();
@@ -76,37 +78,61 @@ async function initialize(mode) {
 
 /**
  * Initialize broker based on mode
+ *
+ * In live mode this connects to the real broker and aborts before any order
+ * can be sent if authentication fails. `dryRun` forces the paper broker so the
+ * full pipeline can be exercised without touching real money.
  */
-async function initializeBroker(mode) {
+async function initializeBroker(mode, { dryRun = false } = {}) {
   const initialCapital = config.get('trading.initialCapital');
+  const effectiveMode = dryRun ? 'paper' : mode;
 
-  switch (mode) {
+  switch (effectiveMode) {
     case 'paper':
       app.broker = new PaperBroker(initialCapital);
       await app.broker.connect();
       break;
 
-    case 'live':
+    case 'live': {
+      // Fail fast before constructing a live broker connection.
+      if (!process.env.KITE_API_KEY || !process.env.KITE_ACCESS_TOKEN) {
+        logger.error('Live mode requires KITE_API_KEY and KITE_ACCESS_TOKEN. Aborting.');
+        process.exit(1);
+      }
+
       app.broker = new KiteBroker({
         apiKey: process.env.KITE_API_KEY,
         apiSecret: process.env.KITE_API_SECRET,
         accessToken: process.env.KITE_ACCESS_TOKEN,
       });
       const result = await app.broker.connect();
-      if (!result.success && !result.requiresAuth) {
-        logger.error('Failed to connect to live broker');
+      if (!result.success) {
+        if (result.requiresAuth) {
+          logger.error('Kite requires authentication. Open this URL to get an access token:', {
+            loginUrl: result.loginUrl,
+          });
+        } else {
+          logger.error('Failed to connect to live broker', { reason: result.reason });
+        }
         process.exit(1);
       }
       break;
+    }
 
     case 'backtest':
       // No broker needed for backtesting
       break;
+
+    default:
+      logger.error(`Unknown mode: ${effectiveMode}`);
+      process.exit(1);
   }
 
   // Initialize order manager with broker
   if (app.broker) {
     app.orderManager = new OrderManager(app.broker);
+    // P1-4: monitor open positions for stop-loss / target hits.
+    app.positionMonitor = new PositionMonitor(app.orderManager);
   }
 
   logger.info(`Broker initialized: ${app.broker?.name || 'N/A'}`);
@@ -184,11 +210,17 @@ function setupEventHandlers() {
     await handleTradeSignal(signal);
   });
 
-  // Handle order fills
+  // Handle order fills (newly opened positions) -> persist the trade row
   eventBus.on('order_filled', (trade) => {
-    // Save to database
-    if (app.mode !== 'backtest') {
+    if (app.mode !== 'backtest' && tradeRepository.initialized) {
       tradeRepository.saveTrade(trade);
+    }
+  });
+
+  // Handle closes -> persist the exit so trades don't stay OPEN forever
+  eventBus.on('position_closed', (result) => {
+    if (app.mode !== 'backtest' && tradeRepository.initialized && result?.tradeId) {
+      tradeRepository.updateTradeExit(result.tradeId, result.exitPrice, result.pnl);
     }
   });
 
@@ -259,6 +291,20 @@ async function runPaperTrading() {
     });
   });
 
+  // P1-6: bridge simulator ticks onto the central event bus, so the order
+  // manager's unrealized PnL and the broker's price marks actually update.
+  marketStream.on('tick', (tick) => {
+    eventBus.emitSafe('market_tick', tick);
+    if (typeof app.broker?.updatePrices === 'function') {
+      app.broker.updatePrices({ [tick.symbol]: tick.price });
+    }
+  });
+
+  // P1-4: start the exit lifecycle (stop-loss / target enforcement).
+  if (app.positionMonitor) {
+    app.positionMonitor.start();
+  }
+
   // Start market data
   marketStream.start();
   candleBuilder.start();
@@ -298,7 +344,6 @@ async function runBacktest(options = {}) {
   logger.info('Starting Backtest...');
 
   // Load historical data
-  const dataPath = `./data/historical/symbols/${symbol}.json`;
   const historicalData = loadDataFromFile(
     new URL('../data/historical/symbols/' + symbol + '.json', import.meta.url).pathname
   );
@@ -367,11 +412,26 @@ async function runLiveTrading() {
     process.exit(1);
   }
 
-  logger.info('Starting Live Trading...');
+  // P0-1: never drive a real broker off the simulated feed. `runPaperTrading`
+  // used to be called here, which would have sent genuine Kite orders priced
+  // from random-walk numbers. Refuse unless a real feed is configured.
+  if (!config.get('market.liveFeed.enabled')) {
+    logger.error(
+      'Refusing to start live trading: no real market-data feed is configured ' +
+      '(market.liveFeed.enabled is false), so the built-in simulator would be ' +
+      'pricing real orders.'
+    );
+    logger.error(
+      'Either implement market/liveFeed.js and set market.liveFeed.enabled=true, ' +
+      'or use --dry-run to exercise the full pipeline against the paper broker.'
+    );
+    process.exit(1);
+  }
 
-  // Similar to paper trading but with real broker
-  // Implementation depends on broker setup
-  await runPaperTrading(); // Placeholder - in production, use actual live data
+  // TODO(live-feed): once market.liveFeed.enabled is true, stream real ticks
+  // onto eventBus as 'market_tick' and run the same order/exit pipeline.
+  logger.error('Live market-data feed is not implemented yet.');
+  process.exit(1);
 }
 
 /**
@@ -380,7 +440,8 @@ async function runLiveTrading() {
 function printStatus() {
   const portfolio = app.broker?.getPortfolio?.();
   const stats = app.orderManager?.getStats();
-  const riskStats = riskManager.getStats();
+  const positions = app.orderManager?.getPositions() || [];
+  const riskStats = riskManager.getStats(positions);
 
   logger.info('\n' + '='.repeat(40));
   logger.info('PORTFOLIO STATUS');
@@ -429,7 +490,8 @@ async function shutdown(statusInterval) {
 
   clearInterval(statusInterval);
 
-  // Stop market data
+  // Stop market data and the position monitor
+  app.positionMonitor?.stop();
   marketStream.stop();
   candleBuilder.stop();
 
@@ -473,7 +535,8 @@ async function main() {
     .option('--mode <mode>', 'Trading mode: paper, backtest, live', 'paper')
     .option('--symbol <symbol>', 'Symbol to trade/backtest', 'RELIANCE')
     .option('--strategy <strategy>', 'Strategy to use/backtest', 'all')
-    .option('--capital <amount>', 'Initial capital', '100000');
+    .option('--capital <amount>', 'Initial capital', '100000')
+    .option('--dry-run', 'Force the paper broker regardless of --mode (never real money)', false);
 
   const options = program.parse().opts();
 
@@ -483,8 +546,9 @@ async function main() {
     config.set('backtest.initialCapital', parseFloat(options.capital));
   }
 
+  // --dry-run never runs live code; paper broker + simulated feed only.
   try {
-    await initialize(options.mode);
+    await initialize(options.mode, { dryRun: options.dryRun });
 
     switch (options.mode) {
       case 'paper':
@@ -497,6 +561,11 @@ async function main() {
         });
         break;
       case 'live':
+        if (options.dryRun) {
+          logger.warn('DRY RUN: --mode live --dry-run uses the PaperBroker with simulated data.');
+          await runPaperTrading();
+          break;
+        }
         await runLiveTrading();
         break;
       default:

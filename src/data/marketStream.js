@@ -28,6 +28,10 @@ class MarketStream extends EventEmitter {
    * Initialize with starting prices
    */
   initialize(startingPrices) {
+    // Re-read config so overrides applied after import are honoured.
+    this.symbols = config.get('market.symbols');
+    this.tickInterval = config.get('market.tickIntervalMs');
+
     this.symbols.forEach(symbol => {
       const basePrice = startingPrices[symbol] || this._getDefaultPrice(symbol);
       this.currentPrices.set(symbol, {

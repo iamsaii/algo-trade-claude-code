@@ -269,6 +269,105 @@ test('PositionMonitor closes via the broker on stop-loss', async () => {
   mon.stop();
 });
 
+test('FLIP records the remainder in the trade journal, not the full order qty', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+
+  const o1 = om.createOrder({ symbol: 'F', action: 'BUY', entryPrice: 100, strategy: 'T' }, 4);
+  await om.executeOrder(o1.id);
+  const o2 = om.createOrder({ symbol: 'F', action: 'SELL', entryPrice: 110, strategy: 'T' }, 10);
+  await om.executeOrder(o2.id);
+
+  const broker = await b.getPosition('F');
+  assert(broker.side === 'SELL' && broker.quantity === 6, `broker should hold SELL 6, got ${broker.side} ${broker.quantity}`);
+
+  const open = om.getTradeHistory(50).filter(t => t.status === 'OPEN');
+  assert(open.length === 1, `expected exactly 1 OPEN trade, got ${open.length}`);
+  assert(open[0].side === 'SELL', `OPEN trade should be SELL, got ${open[0].side}`);
+  assert(open[0].quantity === 6, `journal qty must match broker remainder 6, got ${open[0].quantity}`);
+
+  // Closing the remainder must fully settle the journal: no stale OPEN record.
+  await om.closePositionViaBroker('F', 105, 'Exit');
+  assert((await b.getPosition('F')) === null, 'broker should be flat');
+  const stillOpen = om.getTradeHistory(50).filter(t => t.status === 'OPEN');
+  assert(stillOpen.length === 0, `journal must have no OPEN trades when flat, got ${stillOpen.length}`);
+});
+
+test('partial closing fill re-arms the exit guard', async () => {
+  // Stub broker that always fills only 4 units of a closing order.
+  const stub = {
+    name: 'stub',
+    position: null,
+    async connect() { return true; },
+    async getPositions() { return this.position ? [{ ...this.position }] : []; },
+    async getPosition(symbol) {
+      return this.position && this.position.symbol === symbol ? { ...this.position } : null;
+    },
+    async placeOrder(order) {
+      if (!this.position) {
+        this.position = {
+          symbol: order.symbol, side: order.side, quantity: order.quantity,
+          avgPrice: order.entryPrice, currentPrice: order.entryPrice, unrealizedPnL: 0,
+        };
+        return { success: true, fillPrice: order.entryPrice, quantity: order.quantity,
+          orderId: order.id, action: 'OPEN', realizedPnL: 0, closedQuantity: 0 };
+      }
+      if (order.side !== this.position.side) {
+        const closedQty = Math.min(4, this.position.quantity);
+        const pnl = this.position.side === 'BUY'
+          ? (order.entryPrice - this.position.avgPrice) * closedQty
+          : (this.position.avgPrice - order.entryPrice) * closedQty;
+        this.position.quantity -= closedQty;
+        const action = this.position.quantity <= 0 ? 'CLOSE' : 'REDUCE';
+        if (this.position.quantity <= 0) this.position = null;
+        return { success: true, fillPrice: order.entryPrice, quantity: closedQty,
+          orderId: order.id, action, realizedPnL: pnl, closedQuantity: closedQty };
+      }
+      this.position.quantity += order.quantity;
+      return { success: true, fillPrice: order.entryPrice, quantity: order.quantity,
+        orderId: order.id, action: 'ADD', realizedPnL: 0, closedQuantity: 0 };
+    },
+  };
+
+  const om = new OrderManager(stub);
+  const o1 = om.createOrder(
+    { symbol: 'P', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' },
+    10
+  );
+  await om.executeOrder(o1.id);
+
+  const c1 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c1?.success, 'first close should succeed');
+  const after = om.getPosition('P');
+  assert(after && after.quantity === 6, `remainder should be 6, got ${after?.quantity}`);
+  assert(after.exiting === false, `exit guard must be re-armed after a partial fill, got exiting=${after.exiting}`);
+
+  // A later stop tick must still be able to exit the remaining units.
+  const c2 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c2 !== null, 'second close must not be blocked by a stale exiting flag');
+  const afterSecond = await stub.getPosition('P');
+  assert(afterSecond && afterSecond.quantity === 2, `stub fills 4/close: 6 -> 2, got ${afterSecond?.quantity}`);
+
+  // ...and the guard re-arms again, so the last 2 units can still be exited.
+  const c3 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c3 !== null, 'third close must not be blocked');
+  assert((await stub.getPosition('P')) === null, 'broker should be flat after third close');
+});
+
+test('closed trade keeps its exit reason', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+  const o1 = om.createOrder({ symbol: 'R', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' }, 5);
+  await om.executeOrder(o1.id);
+
+  await om.closePositionViaBroker('R', 95, 'Stop Loss');
+  const closed = om.getTradeHistory(50).find(t => t.symbol === 'R' && t.status === 'CLOSED');
+  assert(closed, 'expected a closed trade');
+  assert(closed.exitReason === 'Stop Loss', `exitReason must be preserved, got ${closed.exitReason}`);
+});
+
 // Test runner behaviour
 logger.info('\n=== Testing Test Runner ===\n');
 

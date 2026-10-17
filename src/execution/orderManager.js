@@ -82,6 +82,7 @@ class OrderManager extends EventEmitter {
       stopLoss: signal.stopLoss,
       target: signal.target,
       strategy: signal.strategy || 'unknown',
+      reason: signal.reason ?? null,
       status: 'PENDING',
       createdAt: Date.now(),
       filledAt: null,
@@ -311,12 +312,18 @@ class OrderManager extends EventEmitter {
       }
     }
 
+    // A FLIP closes part of the position and re-opens the remainder: the new
+    // trade record must hold only the remainder, not the whole order size.
+    const openQuantity = effect.action === 'FLIP'
+      ? order.quantity - effect.closedQuantity
+      : order.quantity;
+
     const trade = {
       id: generateOrderId().replace('ORD', 'TRD'),
       orderId: order.id,
       symbol,
       side: order.side,
-      quantity: order.quantity,
+      quantity: openQuantity,
       entryPrice: fillPrice,
       exitPrice: null,
       stopLoss: order.stopLoss,
@@ -350,6 +357,17 @@ class OrderManager extends EventEmitter {
         exiting: false,
         exitReason: null,
       });
+      return;
+    }
+
+    // Position still open after a non-opening fill: the in-flight exit attempt
+    // has now landed (possibly only partially), so re-arm the guard. Otherwise
+    // a partial close would leave `exiting` stuck true and the remainder could
+    // never be exited again — including at shutdown.
+    const level = this.exitLevels.get(symbol);
+    if (level) {
+      level.exiting = false;
+      level.exitReason = null;
     }
   }
 

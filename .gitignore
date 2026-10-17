@@ -5,3 +5,7 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+
+# OpenCode skill-installation artifacts (regenerable, not app code)
+.agents/
+skills-lock.json

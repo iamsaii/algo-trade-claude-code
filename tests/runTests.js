@@ -15,15 +15,12 @@ import { calculatePerformanceMetrics } from '../src/backtest/performance.js';
 let passed = 0;
 let failed = 0;
 
+// Tests are collected first, then run sequentially with await, so async test
+// functions are actually awaited before they are reported or the summary prints.
+const pendingTests = [];
+
 function test(name, fn) {
-  try {
-    fn();
-    logger.info(`✓ ${name}`);
-    passed++;
-  } catch (error) {
-    logger.error(`✗ ${name}: ${error.message}`);
-    failed++;
-  }
+  pendingTests.push({ name, fn });
 }
 
 function assert(condition, message) {
@@ -176,15 +173,40 @@ test('Performance metrics calculates correctly', () => {
   assert(metrics.totalReturnPercent !== undefined, 'No return');
 });
 
+// Test runner behaviour
+logger.info('\n=== Testing Test Runner ===\n');
+
+let asyncValue = null;
+test('runner awaits async tests', async () => {
+  await new Promise(r => setTimeout(r, 20));
+  asyncValue = 42;
+});
+test('async value is set once awaited', () => {
+  assert(asyncValue === 42, `expected 42, got ${asyncValue}`);
+});
+
 // Summary
-logger.info('\n=== Test Summary ===\n');
-logger.info(`Passed: ${passed}`);
-logger.info(`Failed: ${failed}`);
-logger.info(`Total: ${passed + failed}`);
+(async () => {
+  for (const { name, fn } of pendingTests) {
+    try {
+      await fn();
+      logger.info(`✓ ${name}`);
+      passed++;
+    } catch (error) {
+      logger.error(`✗ ${name}: ${error.message}`);
+      failed++;
+    }
+  }
 
-if (failed > 0) {
-  process.exit(1);
-}
+  logger.info('\n=== Test Summary ===\n');
+  logger.info(`Passed: ${passed}`);
+  logger.info(`Failed: ${failed}`);
+  logger.info(`Total: ${passed + failed}`);
 
-logger.info('\n✓ All tests passed!\n');
-process.exit(0);
+  if (failed > 0) {
+    process.exit(1);
+  }
+
+  logger.info('\n✓ All tests passed!\n');
+  process.exit(0);
+})();

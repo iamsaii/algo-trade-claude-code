@@ -219,6 +219,34 @@ test('PaperBroker reports fill effect and realized PnL', async () => {
   assert(r3.action === 'OPEN', `expected OPEN, got ${r3.action}`);
 });
 
+test('OrderManager mirrors broker positions and PnL', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+
+  const o1 = om.createOrder(
+    { symbol: 'Y', action: 'BUY', entryPrice: 200, stopLoss: 190, target: 220, strategy: 'T' },
+    5
+  );
+  await om.executeOrder(o1.id);
+
+  assert(om.getPositions().length === 1, `mirror should have 1, got ${om.getPositions().length}`);
+  const merged = om.getPosition('Y');
+  assert(merged && merged.stopLoss === 190 && merged.target === 220, 'exit levels should be merged');
+  assert(merged.quantity === 5 && merged.avgPrice === 200, 'broker position values should flow through');
+
+  const closeResult = await om.closePositionViaBroker('Y', 210, 'Target');
+  assert(closeResult && closeResult.success, 'close should succeed');
+  assert(om.getPositions().length === 0, 'mirror should be flat');
+  assert(om.getPosition('Y') === null, 'exit level should be cleared');
+
+  const brokerPnL = (await b.getAccountBalance()).totalPnL;
+  assert(
+    Math.abs(om.getPnL().realized - brokerPnL) < 1e-6,
+    `PnL parity: om=${om.getPnL().realized} broker=${brokerPnL}`
+  );
+});
+
 // Test runner behaviour
 logger.info('\n=== Testing Test Runner ===\n');
 

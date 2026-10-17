@@ -1,12 +1,17 @@
 /**
  * Order Manager
- * Handles order lifecycle, position tracking, and PnL calculation
+ * Handles order lifecycle, the trade journal, and protective exit levels.
+ *
+ * The broker is authoritative for positions and realized PnL. This class
+ * keeps a refreshed mirror of broker positions (positionCache) plus the
+ * working state a broker does not own: open orders, protective stop/target
+ * levels, and the trade journal.
  *
  * Features:
- * - Order creation and validation
- * - Position tracking per symbol
- * - Real-time PnL calculation
- * - Order history
+ * - Order creation, validation, and execution
+ * - Broker-authoritative position mirror (syncPositions)
+ * - Protective exit levels (stop/target) and exit in-flight guard
+ * - Trade journal with realized PnL settled from the broker's fill report
  */
 
 import { EventEmitter } from 'events';
@@ -33,7 +38,11 @@ class OrderManager extends EventEmitter {
     this.broker = broker;
     this.orders = new Map(); // All orders by ID
     this.openOrders = new Map(); // Pending orders
-    this.positions = new Map(); // Current positions by symbol
+    // The broker is authoritative for positions. We keep a mirror
+    // (positionCache) refreshed via syncPositions(), plus exchange-agnostic
+    // working state: protective exit levels per symbol.
+    this.positionCache = [];
+    this.exitLevels = new Map(); // symbol -> { stopLoss, target, strategy, entryOrderId, exiting, exitReason }
     this.orderHistory = []; // Completed orders
     this.tradeHistory = []; // Executed trades
 
@@ -124,7 +133,7 @@ class OrderManager extends EventEmitter {
       const fillResult = await this.broker.placeOrder(order);
 
       if (fillResult.success) {
-        return this._fillOrder(orderId, fillResult.fillPrice, fillResult.quantity || order.quantity);
+        return await this._fillOrder(orderId, fillResult);
       } else {
         return this._rejectOrder(orderId, fillResult.reason);
       }
@@ -135,16 +144,27 @@ class OrderManager extends EventEmitter {
   }
 
   /**
-   * Fill an order (called when broker executes)
+   * Fill an order (called when broker executes). The broker is authoritative
+   * for positions and realized PnL; this method mirrors that state and keeps
+   * the trade journal and exit levels in step.
    */
-  _fillOrder(orderId, fillPrice, quantity) {
+  async _fillOrder(orderId, fillResult) {
     const order = this.orders.get(orderId);
     if (!order) return null;
+
+    const fillPrice = fillResult.fillPrice;
+    const quantity = fillResult.quantity || order.quantity;
+    const effect = {
+      action: fillResult.action || 'OPEN',
+      realizedPnL: fillResult.realizedPnL || 0,
+      closedQuantity: fillResult.closedQuantity || 0,
+    };
 
     order.status = 'FILLED';
     order.fillPrice = fillPrice;
     order.quantity = quantity;
     order.filledAt = Date.now();
+    order.action = effect.action;
 
     // Remove from open orders
     this.openOrders.delete(orderId);
@@ -152,13 +172,36 @@ class OrderManager extends EventEmitter {
     // Add to history
     this.orderHistory.push(order);
 
-    // Update position (a closing fill settles the existing trade record).
-    const update = this._updatePosition(order);
+    // Settle the closed slice (if any) against the open trade record.
+    let settledTrade = null;
+    if (effect.closedQuantity > 0) {
+      this._applyRealizedPnL(effect.realizedPnL);
+      settledTrade = this._settleOpenTrade(order.symbol, fillPrice, effect, order.reason);
+    }
 
-    // Maintain exactly one OPEN trade record per open position.
-    const { trade, opened } = this._recordFill(order, fillPrice, quantity, update);
+    // Only opening/increasing/flipping fills create or roll a trade record.
+    let trade = null;
+    let opened = false;
+    if (effect.action === 'OPEN' || effect.action === 'ADD' || effect.action === 'FLIP') {
+      ({ trade, opened } = this._openTradeRecord(order, fillPrice, effect));
+    }
 
-    if (trade) {
+    // Broker is authoritative: refresh the mirror before exposing positions.
+    await this.syncPositions();
+    this._syncExitLevels(order, opened);
+
+    if (effect.closedQuantity > 0) {
+      eventBus.emitSafe('position_closed', {
+        tradeId: settledTrade?.id || null,
+        symbol: order.symbol,
+        quantity: effect.closedQuantity,
+        exitPrice: fillPrice,
+        pnl: effect.realizedPnL,
+      });
+    }
+
+    if (opened && trade) {
+      this.totalTrades++;
       logger.trade({
         action: order.side,
         symbol: order.symbol,
@@ -166,23 +209,19 @@ class OrderManager extends EventEmitter {
         entryPrice: fillPrice,
         strategy: order.strategy,
       });
-    } else {
-      logger.debug('Closing fill settled existing position', {
-        symbol: order.symbol,
-        orderId: order.id,
-      });
-    }
-
-    // Emit only for newly opened positions; closes emit position_closed.
-    if (opened && trade) {
-      this.totalTrades++;
       eventBus.emitSafe('order_filled', {
         ...trade,
         entryPrice: fillPrice,
       });
+    } else {
+      logger.debug('Fill settled existing position', {
+        symbol: order.symbol,
+        orderId: order.id,
+        action: effect.action,
+      });
     }
 
-    return { success: true, order, trade };
+    return { success: true, order, trade, settled: settledTrade };
   }
 
   /**
@@ -205,51 +244,71 @@ class OrderManager extends EventEmitter {
   }
 
   /**
-   * Update position after order fill
+   * Apply realized PnL from a closing fill to the local summary and stats.
+   * The broker has already moved the cash; this keeps the mirror in step.
    */
-  _updatePosition(order) {
-    const existing = this.positions.get(order.symbol);
+  _applyRealizedPnL(pnl) {
+    this.realizedPnL += pnl;
+    if (pnl > 0) this.winningTrades++;
+    else if (pnl < 0) this.losingTrades++;
+  }
 
-    if (existing && existing.side !== order.side) {
-      // Opposite side -> reduce/close, then open the remainder (if any).
-      if (order.reason) existing.exitReason = order.reason;
-      const closed = this._closePosition(order.symbol, order.fillPrice, order.quantity);
-      const remainder = order.quantity - (closed?.quantity || 0);
-      let opened = false;
-      if (remainder > 0) {
-        this._openOrAddPosition(order.symbol, order.side, order.fillPrice, remainder, order);
-        opened = true;
-      }
-      return { closed: !!closed, opened };
+  /**
+   * Settle the open trade record for a symbol against a closing fill.
+   * A full close closes the record; a partial reduction settles only the
+   * closed slice and leaves the remainder open.
+   */
+  _settleOpenTrade(symbol, exitPrice, effect, reason) {
+    const closedQuantity = effect.closedQuantity;
+    const openTrade = this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
+    if (!openTrade) return null;
+
+    if (closedQuantity >= openTrade.quantity) {
+      openTrade.exitPrice = exitPrice;
+      openTrade.pnl = effect.realizedPnL;
+      openTrade.status = 'CLOSED';
+      openTrade.closedAt = Date.now();
+      openTrade.exitReason = reason ?? openTrade.exitReason ?? null;
+      return openTrade;
     }
 
-    this._openOrAddPosition(order.symbol, order.side, order.fillPrice, order.quantity, order);
-    return { closed: false, opened: true };
+    // Partial close: settle the closed slice, keep the remainder open.
+    const closedSlice = {
+      ...openTrade,
+      id: `${openTrade.id}-P${this.tradeHistory.length}`,
+      quantity: closedQuantity,
+      exitPrice,
+      pnl: effect.realizedPnL,
+      status: 'CLOSED',
+      closedAt: Date.now(),
+      exitReason: reason ?? null,
+    };
+    this.tradeHistory.push(closedSlice);
+    openTrade.quantity -= closedQuantity;
+    return closedSlice;
   }
 
   /**
    * Maintain exactly one OPEN trade record per open position.
-   * A pure closing fill has no new trade record (the close event settles it).
-   * Returns { trade, opened } - trade is null for a pure close.
+   * Opening creates a record; adding rolls into the existing one.
    */
-  _recordFill(order, fillPrice, quantity, update = {}) {
+  _openTradeRecord(order, fillPrice, effect) {
     const symbol = order.symbol;
 
-    if (update.closed && !update.opened) {
-      return { trade: null, opened: false };
-    }
-
-    const existing = this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
-
-    if (existing && existing.side === order.side) {
-      // Increase: roll into the existing open trade instead of duplicating it.
-      const totalQuantity = existing.quantity + quantity;
-      existing.entryPrice = (existing.entryPrice * existing.quantity + fillPrice * quantity) / totalQuantity;
-      existing.quantity = totalQuantity;
-      existing.orderId = order.id;
-      if (order.stopLoss != null) existing.stopLoss = order.stopLoss;
-      if (order.target != null) existing.target = order.target;
-      return { trade: existing, opened: false };
+    if (effect.action === 'ADD') {
+      const existing = this.tradeHistory.find(
+        t => t.symbol === symbol && t.status === 'OPEN' && t.side === order.side
+      );
+      if (existing) {
+        const totalQuantity = existing.quantity + order.quantity;
+        existing.entryPrice =
+          (existing.entryPrice * existing.quantity + fillPrice * order.quantity) / totalQuantity;
+        existing.quantity = totalQuantity;
+        existing.orderId = order.id;
+        if (order.stopLoss != null) existing.stopLoss = order.stopLoss;
+        if (order.target != null) existing.target = order.target;
+        return { trade: existing, opened: false };
+      }
     }
 
     const trade = {
@@ -257,7 +316,7 @@ class OrderManager extends EventEmitter {
       orderId: order.id,
       symbol,
       side: order.side,
-      quantity,
+      quantity: order.quantity,
       entryPrice: fillPrice,
       exitPrice: null,
       stopLoss: order.stopLoss,
@@ -272,102 +331,61 @@ class OrderManager extends EventEmitter {
   }
 
   /**
-   * Open or add to position
+   * Set or clear protective exit levels so they track the broker's positions.
    */
-  _openOrAddPosition(symbol, side, price, quantity, order = {}) {
-    const existing = this.positions.get(symbol);
+  _syncExitLevels(order, opened) {
+    const symbol = order.symbol;
 
-    if (existing) {
-      // Add to position (average price)
-      const totalValue = existing.quantity * existing.avgPrice + quantity * price;
-      const totalQuantity = existing.quantity + quantity;
-      existing.avgPrice = totalValue / totalQuantity;
-      existing.quantity = totalQuantity;
-      if (order.id) existing.orderId = order.id;
-      if (order.stopLoss != null) existing.stopLoss = order.stopLoss;
-      if (order.target != null) existing.target = order.target;
-    } else {
-      // New position - keep the protective levels and metadata so the
-      // position monitor and exits can act on it later.
-      this.positions.set(symbol, {
-        symbol,
-        side,
-        quantity,
-        avgPrice: price,
-        currentPrice: price,
-        unrealizedPnL: 0,
-        openedAt: Date.now(),
-        orderId: order.id || null,
+    if (!this.positionCache.some(p => p.symbol === symbol)) {
+      this.exitLevels.delete(symbol);
+      return;
+    }
+
+    if (opened) {
+      this.exitLevels.set(symbol, {
         stopLoss: order.stopLoss ?? null,
         target: order.target ?? null,
         strategy: order.strategy || 'unknown',
+        entryOrderId: order.id,
         exiting: false,
+        exitReason: null,
       });
     }
-
-    this._recalculateUnrealizedPnL();
   }
 
   /**
-   * Close position (partially or fully)
+   * Refresh the position mirror from the broker (authoritative) and drop any
+   * exit levels whose position no longer exists.
    */
-  _closePosition(symbol, exitPrice, closeQuantity) {
-    const position = this.positions.get(symbol);
-    if (!position) return null;
+  async syncPositions() {
+    this.positionCache = await this.broker.getPositions();
 
-    const quantityToClose = Math.min(closeQuantity, position.quantity);
-    let pnl;
-
-    if (position.side === 'BUY') {
-      pnl = (exitPrice - position.avgPrice) * quantityToClose;
-    } else {
-      pnl = (position.avgPrice - exitPrice) * quantityToClose;
+    for (const symbol of [...this.exitLevels.keys()]) {
+      if (!this.positionCache.some(p => p.symbol === symbol)) {
+        this.exitLevels.delete(symbol);
+      }
     }
 
-    // Update realized PnL
-    this.realizedPnL += pnl;
+    this._recalculateUnrealizedPnL();
+    return this.positionCache;
+  }
 
-    // Update trade stats
-    if (pnl > 0) this.winningTrades++;
-    else if (pnl < 0) this.losingTrades++;
+  /**
+   * Merge a broker position with its local protective levels.
+   */
+  _mergeExitLevel(position) {
+    const level = this.exitLevels.get(position.symbol);
+    if (!level) return { ...position };
 
-    // Update or remove position
-    position.quantity -= quantityToClose;
-    if (position.quantity <= 0) {
-      this.positions.delete(symbol);
-    }
-
-    // Match this close to the open trade it belongs to (by originating order first).
-    const openTrade = this.tradeHistory.find(t =>
-      t.status === 'OPEN' &&
-      (position.orderId ? t.orderId === position.orderId : t.symbol === symbol)
-    ) || this.tradeHistory.find(t => t.symbol === symbol && t.status === 'OPEN');
-
-    if (openTrade) {
-      openTrade.exitPrice = exitPrice;
-      openTrade.pnl = pnl;
-      openTrade.status = 'CLOSED';
-      openTrade.closedAt = Date.now();
-      openTrade.exitReason = position.exitReason;
-    }
-
-    logger.info('Position closed', {
-      symbol,
-      quantity: quantityToClose,
-      exitPrice,
-      pnl,
-    });
-
-    // Emit event - includes tradeId so the risk manager can settle correctly.
-    eventBus.emitSafe('position_closed', {
-      tradeId: openTrade?.id || null,
-      symbol,
-      quantity: quantityToClose,
-      exitPrice,
-      pnl,
-    });
-
-    return { pnl, quantity: quantityToClose };
+    return {
+      ...position,
+      stopLoss: level.stopLoss,
+      target: level.target,
+      strategy: level.strategy,
+      orderId: level.entryOrderId,
+      exiting: level.exiting,
+      exitReason: level.exitReason,
+    };
   }
 
   /**
@@ -375,12 +393,15 @@ class OrderManager extends EventEmitter {
    * broker's cash ledger and the order manager's ledger stay in sync.
    */
   async closePositionViaBroker(symbol, exitPrice, reason = 'Exit') {
-    const position = this.positions.get(symbol);
+    const position = this.getPosition(symbol);
     if (!position || position.exiting) return null;
 
     // Guard against double-triggering from rapid ticks before the fill lands.
-    position.exiting = true;
-    position.exitReason = reason;
+    const level = this.exitLevels.get(symbol);
+    if (level) {
+      level.exiting = true;
+      level.exitReason = reason;
+    }
 
     const signal = {
       symbol,
@@ -394,14 +415,14 @@ class OrderManager extends EventEmitter {
 
     const order = this.createOrder(signal, position.quantity);
     if (!order) {
-      position.exiting = false;
+      if (level) level.exiting = false;
       return null;
     }
 
     const result = await this.executeOrder(order.id);
     if (!result || !result.success) {
       // Still open (or not found) - allow a future attempt.
-      const stillOpen = this.positions.get(symbol);
+      const stillOpen = this.exitLevels.get(symbol);
       if (stillOpen) stillOpen.exiting = false;
     }
     return result;
@@ -411,7 +432,7 @@ class OrderManager extends EventEmitter {
    * Update unrealized PnL for a tick
    */
   _updateUnrealizedPnL(tick) {
-    const position = this.positions.get(tick.symbol);
+    const position = this.positionCache.find(p => p.symbol === tick.symbol);
     if (!position) return;
 
     position.currentPrice = tick.price;
@@ -429,24 +450,22 @@ class OrderManager extends EventEmitter {
    * Recalculate total unrealized PnL
    */
   _recalculateUnrealizedPnL() {
-    this.unrealizedPnL = 0;
-    for (const position of this.positions.values()) {
-      this.unrealizedPnL += position.unrealizedPnL;
-    }
+    this.unrealizedPnL = this.positionCache.reduce((sum, p) => sum + (p.unrealizedPnL || 0), 0);
   }
 
   /**
-   * Get current positions
+   * Get current positions (mirror of the broker, with exit levels merged in)
    */
   getPositions() {
-    return Array.from(this.positions.values());
+    return this.positionCache.map(p => this._mergeExitLevel(p));
   }
 
   /**
    * Get position for a symbol
    */
   getPosition(symbol) {
-    return this.positions.get(symbol);
+    const position = this.positionCache.find(p => p.symbol === symbol);
+    return position ? this._mergeExitLevel(position) : null;
   }
 
   /**
@@ -491,7 +510,7 @@ class OrderManager extends EventEmitter {
       realizedPnL: this.realizedPnL,
       unrealizedPnL: this.unrealizedPnL,
       totalPnL: this.realizedPnL + this.unrealizedPnL,
-      openPositions: this.positions.size,
+      openPositions: this.positionCache.length,
       openOrders: this.openOrders.size,
     };
   }
@@ -502,12 +521,14 @@ class OrderManager extends EventEmitter {
   async closeAllPositions(currentPrices) {
     const results = [];
 
-    // Snapshot keys: closing mutates this.positions.
-    for (const [symbol, position] of [...this.positions]) {
-      const price = currentPrices[symbol] || position.currentPrice;
-      const result = await this.closePositionViaBroker(symbol, price, 'Shutdown');
+    // Snapshot the mirror first: closing mutates it via syncPositions().
+    const open = this.getPositions();
+
+    for (const position of open) {
+      const price = currentPrices[position.symbol] || position.currentPrice;
+      const result = await this.closePositionViaBroker(position.symbol, price, 'Shutdown');
       if (result?.success) {
-        results.push({ symbol, pnl: result?.trade?.pnl ?? 0 });
+        results.push({ symbol: position.symbol, pnl: result?.settled?.pnl ?? 0 });
       }
     }
 

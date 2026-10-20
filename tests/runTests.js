@@ -18,6 +18,7 @@ import config from '../src/core/config.js';
 import { eventBus } from '../src/core/eventBus.js';
 import aiGate from '../src/ai/aiGate.js';
 import { TradeRepository } from '../src/storage/tradeRepository.js';
+import aiJournal from '../src/ai/journal.js';
 
 let passed = 0;
 let failed = 0;
@@ -456,6 +457,20 @@ test('ai ledger tracks margin spend, open lots, and sell-guard quantities', asyn
   const one = repo.getOpenAiLot('TCS');
   assert(one && one.quantity === 7, 'per-symbol lot');
   assert(repo.getOpenAiLot('INFY') === null, 'unknown symbol -> null');
+});
+
+// AI journal
+logger.info('\n=== Testing AI Journal ===\n');
+
+test('journal appends readable entries per day', () => {
+  const date = '2026-10-19';
+  const { append, read } = aiJournal;
+  append(date, { type: 'DECISION', data: { symbol: 'TCS', confidence: 0.8 } });
+  append(date, { type: 'REJECTED', data: { symbol: 'X', reason: 'max trades' } });
+  const text = read(date);
+  assert(text.includes('[DECISION]') && text.includes('TCS'), 'decision line present');
+  assert(text.includes('[REJECTED]') && text.includes('max trades'), 'rejection line present');
+  assert(/^- \d{2}:\d{2} \[DECISION\]/m.test(text), 'timestamped line format');
 });
 
 // Summary

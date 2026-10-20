@@ -576,6 +576,14 @@ async function runAiCheck() {
   process.exit(0);
 }
 
+async function runAiEod() {
+  const result = await aiRunner.runEod({ broker: app.broker });
+  logger.info('AI EOD square-off complete', { closed: result.closed.length, failed: result.failed.length });
+  // A failed square-off must be visible to cron (exit 1), never silent.
+  tradeRepository.close();
+  process.exit(result.failed.length > 0 ? 1 : 0);
+}
+
 /**
  * Main entry point
  */
@@ -588,7 +596,7 @@ async function main() {
     .version('1.0.0');
 
   program
-    .option('--mode <mode>', 'Trading mode: paper, backtest, live, ai, check', 'paper')
+    .option('--mode <mode>', 'Trading mode: paper, backtest, live, ai, check, eod', 'paper')
     .option('--symbol <symbol>', 'Symbol to trade/backtest', 'RELIANCE')
     .option('--strategy <strategy>', 'Strategy to use/backtest', 'all')
     .option('--capital <amount>', 'Initial capital', '100000')
@@ -613,6 +621,9 @@ async function main() {
         break;
       case 'check':
         await runAiCheck();
+        break;
+      case 'eod':
+        await runAiEod();
         break;
       case 'paper':
         await runPaperTrading();

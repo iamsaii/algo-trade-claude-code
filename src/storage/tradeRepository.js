@@ -545,12 +545,14 @@ export class TradeRepository {
       SELECT symbol,
              SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS qty,
              MIN(stop_loss) AS stop_loss,
-             MAX(product) AS product
-      FROM ai_ledger
+             MAX(product) AS product,
+             (SELECT SUM(b.price * b.quantity) * 1.0 / SUM(b.quantity)
+                FROM ai_ledger b WHERE b.symbol = l.symbol AND b.side = 'BUY') AS avg_price
+      FROM ai_ledger l
       GROUP BY symbol
       HAVING qty > 0
     `).all();
-    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty, stopLoss: r.stop_loss, product: r.product }));
+    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty, stopLoss: r.stop_loss, product: r.product, avgPrice: r.avg_price }));
   }
 
   /**

@@ -190,5 +190,59 @@ async function checkStops({ broker, fetchFn = fetch, repo = tradeRepository } = 
   return { checked: lots.length, exited, skipped: null };
 }
 
-export { runDecide, checkStops, HALT_FILE };
-export default { runDecide, checkStops, HALT_FILE };
+/**
+ * EOD square-off. Sells every open lot at market (MIS must always
+ * close same-day; when ai.eodExitEnabled is false only MIS lots close
+ * and CNC is held overnight). Idempotent: a flat ledger is a no-op.
+ *
+ * @returns {Promise<{closed: Array, failed: Array}>}
+ */
+async function runEod({ broker, repo = tradeRepository, journal: j = journal } = {}) {
+  const eodExitEnabled = config.get('ai.eodExitEnabled');
+  const tag = config.get('ai.tag');
+
+  let lots = repo.getOpenAiLots();
+  if (!eodExitEnabled) {
+    j.append(todayStr(), { type: 'NOTE', data: { event: 'eod-exit-disabled', detail: 'closing MIS lots only; CNC held overnight' } });
+    lots = lots.filter(l => l.product === 'MIS');
+  }
+
+  const closed = [];
+  const failed = [];
+  for (const lot of lots) {
+    const result = await broker.placeOrder({
+      id: `AI-EOD-${Date.now()}-${lot.symbol}`,
+      symbol: lot.symbol,
+      side: 'SELL',
+      quantity: lot.quantity,
+      entryPrice: lot.avgPrice,
+      strategy: tag,
+      product: lot.product || 'MIS',
+      orderType: 'MARKET',
+    });
+    if (!result || !result.success) {
+      j.append(todayStr(), { type: 'EXIT-FAILED', data: { symbol: lot.symbol, quantity: lot.quantity, reason: result?.reason } });
+      failed.push({ symbol: lot.symbol, quantity: lot.quantity, reason: result?.reason });
+      continue;
+    }
+    const soldQty = result.quantity ?? lot.quantity;
+    const sellPrice = result.fillPrice ?? lot.avgPrice;
+    repo.recordAiFill({
+      symbol: lot.symbol,
+      side: 'SELL',
+      quantity: soldQty,
+      price: sellPrice,
+      product: lot.product || 'MIS',
+      kiteOrderId: result.orderId,
+      reason: 'EOD',
+    });
+    const pnl = (sellPrice - lot.avgPrice) * soldQty;
+    j.append(todayStr(), { type: 'EXIT', data: { symbol: lot.symbol, reason: 'EOD', quantity: soldQty, price: sellPrice, pnl } });
+    closed.push({ symbol: lot.symbol, quantity: soldQty, price: sellPrice, pnl });
+  }
+
+  return { closed, failed };
+}
+
+export { runDecide, checkStops, runEod, HALT_FILE };
+export default { runDecide, checkStops, runEod, HALT_FILE };

@@ -638,6 +638,44 @@ test('checkStops exits lots whose ltp hit the stop', async () => {
   assert(repo.getOpenAiLots().length === 0, 'lot closed in ledger');
 });
 
+// AI EOD runner
+logger.info('\n=== Testing AI EOD Runner ===\n');
+
+const tempRepoWithBuy = (symbol, qty, price) => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol, side: 'BUY', quantity: qty, price, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: Math.round(price * 0.97) });
+  return repo;
+};
+
+test('runEod squares off open ai lots and is idempotent', async () => {
+  const sells = [];
+  const stub = { name: 'stub', async isConnected() { return true; },
+    async placeOrder(o) { sells.push(o); return { success: true, fillPrice: 410, quantity: o.quantity, orderId: 'e1', action: 'CLOSE', realizedPnL: 120, closedQuantity: o.quantity }; } };
+  const repo = tempRepoWithBuy('TCS', 12, 400);
+  const r = await aiRunner.runEod({ broker: stub, repo, journal: aiJournal });
+  assert(sells.length === 1 && sells[0].side === 'SELL' && sells[0].quantity === 12, `sold 12 TCS, got ${JSON.stringify(sells)}`);
+  assert(repo.getOpenAiLots().length === 0, 'ledger flat');
+  assert(r.closed.length === 1 && r.closed[0].pnl === 120, `realized pnl journaled, got ${JSON.stringify(r.closed)}`);
+  const r2 = await aiRunner.runEod({ broker: stub, repo, journal: aiJournal });
+  assert(r2.closed.length === 0, 'second run is a no-op');
+});
+
+test('runEod keeps CNC lots overnight when eodExitEnabled is false', async () => {
+  config.set('ai.eodExitEnabled', false);
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 2, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'INFY', side: 'BUY', quantity: 1, price: 900, product: 'CNC', kiteOrderId: 'k2', reason: 'ai' });
+  const sells = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sells.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'e2', action: 'CLOSE', realizedPnL: 0, closedQuantity: o.quantity }; } };
+  await aiRunner.runEod({ broker: stub, repo });
+  assert(sells.length === 1 && sells[0].symbol === 'TCS', `MIS closed only, got ${JSON.stringify(sells)}`);
+  assert(repo.getOpenAiLots().length === 1, 'CNC lot held overnight');
+  config.set('ai.eodExitEnabled', true);
+});
+
 // Summary
 (async () => {
   for (const { name, fn } of pendingTests) {

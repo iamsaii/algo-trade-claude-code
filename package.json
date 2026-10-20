@@ -8,6 +8,10 @@
     "start": "node src/app.js",
     "start:paper": "node src/app.js --mode paper",
     "start:backtest": "node src/app.js --mode backtest",
+    "ai:decide": "node src/app.js --mode ai",
+    "ai:live": "node src/app.js --mode ai --live",
+    "ai:eod": "node src/app.js --mode eod",
+    "ai:check": "node src/app.js --mode check",
     "test": "node tests/runTests.js",
     "generate-data": "node src/data/sampleData.js"
   },

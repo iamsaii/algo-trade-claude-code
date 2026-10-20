@@ -24,6 +24,8 @@ import marketBrief from '../src/ai/marketBrief.js';
 import llmAdvisor from '../src/ai/llmAdvisor.js';
 import totp from '../src/ai/totp.js';
 import KiteBroker from '../src/brokers/kiteBroker.js';
+import aiRunner from '../src/ai/aiRunner.js';
+import fs from 'fs';
 
 let passed = 0;
 let failed = 0;
@@ -558,6 +560,82 @@ test('KiteBroker normalizes kite net positions', async () => {
   const list = await kb.getPositions();
   assert(list.length === 1, `flat rows omitted, got ${list.length}`);
   assert(list[0].symbol === 'TCS' && list[0].unrealizedPnL === 50, `normalized: ${JSON.stringify(list[0])}`);
+});
+
+// AI decide runner
+logger.info('\n=== Testing AI Decide Runner ===\n');
+
+const yahooFetch = (ltp, prevClose) => async () => ({
+  ok: true,
+  json: async () => ({ quoteResponse: { result: [{ symbol: 'TCS.NS', regularMarketPrice: ltp, regularMarketPreviousClose: prevClose }] } }),
+});
+
+test('runDecide places gated buys, records fills, and attaches stops', async () => {
+  config.set('ai.dailyBudget', 1000);
+  const placed = [];
+  const stub = { name: 'stub', async isConnected() { return true; },
+    async placeOrder(o) { placed.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k9', action: 'OPEN', realizedPnL: 0, closedQuantity: 0 }; },
+    async placeStopLoss(sym, p) { placed.push({ slFor: sym, ...p }); return { success: true }; } };
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  const r = await aiRunner.runDecide({
+    broker: stub,
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'test' }],
+    repo,
+  });
+  assert(r.placed.length === 1 && placed.some(o => o.symbol === 'TCS' && o.strategy === 'ai-agent'), 'buy placed with tag');
+  assert(placed.some(o => o.slFor === 'TCS' && o.triggerPrice === 390), 'stop attached after fill');
+  assert(repo.getOpenAiLot('TCS').quantity === 12, 'fill recorded in ledger');
+  assert(aiJournal.read(new Date().toLocaleDateString('sv')).includes('[DECISION]'), 'journaled');
+  config.set('ai.dailyBudget', 1000);
+});
+
+test('runDecide skips when halted and spends only remaining budget on rerun', async () => {
+  fs.writeFileSync('data/TRADING_HALTED', '');
+  const r = await aiRunner.runDecide({ broker: { async isConnected() { return true; } }, askFn: async () => [] });
+  fs.unlinkSync('data/TRADING_HALTED');
+  assert(r.skipped && /halt/i.test(r.skipped), 'kill switch respected');
+
+  // ₹900 margin already committed today -> next BUY sizes from ₹100 left
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'INFY', side: 'BUY', quantity: 1, price: 900, product: 'CNC', kiteOrderId: 'k0', reason: 'ai' });
+  const placed = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { placed.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k10', action: 'OPEN', realizedPnL: 0, closedQuantity: 0 }; },
+    async placeStopLoss() { return { success: true }; } };
+  const r2 = await aiRunner.runDecide({
+    broker: stub,
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'test' }],
+    repo,
+  });
+  // budgetLeft 100 * MIS 5 = 500 -> floor(500/400) = 1 share
+  assert(placed.length === 1 && placed[0].quantity === 1, `qty from remaining margin, got ${placed[0]?.quantity}`);
+});
+
+test('runDecide skips when the daily loss limit is hit', () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 10, price: 400, product: 'CNC', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 10, price: 350, product: 'CNC', kiteOrderId: 'k2', reason: 'stop' });
+  return aiRunner.runDecide({ broker: { async isConnected() { return true; } }, askFn: async () => [], repo })
+    .then(r => assert(r.skipped && /loss/i.test(r.skipped), `loss limit respected, got ${r.skipped}`));
+});
+
+test('checkStops exits lots whose ltp hit the stop', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 5, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  const sold = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sold.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k77', action: 'CLOSE', realizedPnL: -25, closedQuantity: o.quantity }; } };
+  const r1 = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(395, 400), repo });
+  assert(r1.exited.length === 0, 'above stop: no exit');
+  const r2 = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(385, 400), repo });
+  assert(r2.exited.length === 1 && sold.length === 1 && sold[0].side === 'SELL' && sold[0].quantity === 5, 'stop hit: market sell');
+  assert(repo.getOpenAiLots().length === 0, 'lot closed in ledger');
 });
 
 // Summary

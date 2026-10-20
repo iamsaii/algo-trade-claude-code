@@ -142,9 +142,18 @@ export class TradeRepository {
         kite_order_id TEXT,
         reason TEXT,
         day TEXT NOT NULL,
+        stop_loss REAL,
         created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
+
+    // Migration for databases created before the stop_loss column existed
+    // (SQLite has no ADD COLUMN IF NOT EXISTS).
+    try {
+      this.db.exec('ALTER TABLE ai_ledger ADD COLUMN stop_loss REAL');
+    } catch (e) {
+      // column already exists — expected on every run after the first
+    }
 
     // Create indexes for better query performance
     this.db.exec(`
@@ -501,12 +510,12 @@ export class TradeRepository {
    * Thrown errors must propagate: an unrecorded fill would break the
    * sell-guard, so the caller must never continue past this silently.
    */
-  recordAiFill({ symbol, side, quantity, price, product = null, kiteOrderId = null, reason = null }) {
+  recordAiFill({ symbol, side, quantity, price, product = null, kiteOrderId = null, reason = null, stopLoss = null }) {
     const stmt = this.db.prepare(`
-      INSERT INTO ai_ledger (symbol, side, quantity, price, product, kite_order_id, reason, day)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO ai_ledger (symbol, side, quantity, price, product, kite_order_id, reason, day, stop_loss)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const info = stmt.run(symbol, side, quantity, price, product, kiteOrderId, reason, todayStr());
+    const info = stmt.run(symbol, side, quantity, price, product, kiteOrderId, reason, todayStr(), stopLoss);
     return info.lastInsertRowid;
   }
 
@@ -527,15 +536,36 @@ export class TradeRepository {
 
   /**
    * Net open AI lots (buys minus sells, positive quantities only).
+   * stopLoss = lowest buy stop, product = last buy's product (the gate
+   * blocks same-symbol re-buys while a lot is open, so both are
+   * unambiguous in practice).
    */
   getOpenAiLots() {
     const rows = this.db.prepare(`
-      SELECT symbol, SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS qty
+      SELECT symbol,
+             SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS qty,
+             MIN(stop_loss) AS stop_loss,
+             MAX(product) AS product
       FROM ai_ledger
       GROUP BY symbol
       HAVING qty > 0
     `).all();
-    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty }));
+    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty, stopLoss: r.stop_loss, product: r.product }));
+  }
+
+  /**
+   * Realized PnL from today's AI sells: (sell price - avg buy price)
+   * * quantity, summed. Sells without any buy on record contribute 0.
+   */
+  getRealizedToday() {
+    const rows = this.db.prepare(`
+      SELECT s.price AS sellPrice, s.quantity,
+             (SELECT SUM(b.price * b.quantity) * 1.0 / SUM(b.quantity)
+                FROM ai_ledger b WHERE b.symbol = s.symbol AND b.side = 'BUY') AS avgBuy
+      FROM ai_ledger s
+      WHERE s.day = ? AND s.side = 'SELL'
+    `).all(todayStr());
+    return rows.reduce((sum, r) => sum + ((r.sellPrice - (r.avgBuy ?? r.sellPrice)) * r.quantity), 0);
   }
 
   /**

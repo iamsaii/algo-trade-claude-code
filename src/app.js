@@ -31,6 +31,7 @@ import PositionMonitor from './execution/positionMonitor.js';
 import PaperBroker from './brokers/paperBroker.js';
 import KiteBroker from './brokers/kiteBroker.js';
 import tradeRepository from './storage/tradeRepository.js';
+import aiRunner from './ai/aiRunner.js';
 import Backtester from './backtest/backtester.js';
 import { generatePerformanceReport } from './backtest/performance.js';
 
@@ -83,7 +84,7 @@ async function initialize(mode, options = {}) {
  * can be sent if authentication fails. `dryRun` forces the paper broker so the
  * full pipeline can be exercised without touching real money.
  */
-async function initializeBroker(mode, { dryRun = false } = {}) {
+async function initializeBroker(mode, { dryRun = false, live = false } = {}) {
   const initialCapital = config.get('trading.initialCapital');
   const effectiveMode = dryRun ? 'paper' : mode;
 
@@ -118,6 +119,39 @@ async function initializeBroker(mode, { dryRun = false } = {}) {
       }
       break;
     }
+
+    case 'ai':
+    case 'check':
+    case 'eod':
+      if (live) {
+        // Double guard before real money: an explicit flag AND env var.
+        if (process.env.KITE_LIVE !== '1') {
+          logger.error('Refusing --live: set KITE_LIVE=1 to confirm real-money AI trading.');
+          process.exit(1);
+        }
+        if (!process.env.KITE_API_KEY) {
+          logger.error('AI live mode requires KITE_API_KEY (TOTP login also needs KITE_API_SECRET, KITE_USER_ID, KITE_PASSWORD, KITE_TOTP_SECRET). Aborting.');
+          process.exit(1);
+        }
+        app.broker = new KiteBroker({
+          apiKey: process.env.KITE_API_KEY,
+          apiSecret: process.env.KITE_API_SECRET,
+          accessToken: process.env.KITE_ACCESS_TOKEN,
+        });
+        const result = await app.broker.connect();
+        if (!result.success) {
+          if (result.requiresAuth && result.loginUrl) {
+            logger.error('Kite requires authentication. Open this URL to get an access token:', { loginUrl: result.loginUrl });
+          } else {
+            logger.error('Failed to connect to Kite for AI live mode', { reason: result.reason });
+          }
+          process.exit(1);
+        }
+      } else {
+        app.broker = new PaperBroker(initialCapital);
+        await app.broker.connect();
+      }
+      break;
 
     case 'backtest':
       // No broker needed for backtesting
@@ -524,6 +558,25 @@ async function shutdown(statusInterval) {
 }
 
 /**
+ * AI one-shot commands (cron): decide once each trading morning, check
+ * stops every 15 minutes in paper mode. Both exit immediately.
+ */
+async function runAiDecide() {
+  const result = await aiRunner.runDecide({ broker: app.broker });
+  if (result.skipped) logger.warn('AI decide skipped', { reason: result.skipped });
+  else logger.info('AI decide complete', { placed: result.placed.length, rejected: result.rejected.length });
+  tradeRepository.close();
+  process.exit(0);
+}
+
+async function runAiCheck() {
+  const result = await aiRunner.checkStops({ broker: app.broker });
+  logger.info('AI stop check complete', { checked: result.checked, exited: result.exited.length, skipped: result.skipped });
+  tradeRepository.close();
+  process.exit(0);
+}
+
+/**
  * Main entry point
  */
 async function main() {
@@ -535,11 +588,12 @@ async function main() {
     .version('1.0.0');
 
   program
-    .option('--mode <mode>', 'Trading mode: paper, backtest, live', 'paper')
+    .option('--mode <mode>', 'Trading mode: paper, backtest, live, ai, check', 'paper')
     .option('--symbol <symbol>', 'Symbol to trade/backtest', 'RELIANCE')
     .option('--strategy <strategy>', 'Strategy to use/backtest', 'all')
     .option('--capital <amount>', 'Initial capital', '100000')
-    .option('--dry-run', 'Force the paper broker regardless of --mode (never real money)', false);
+    .option('--dry-run', 'Force the paper broker regardless of --mode (never real money)', false)
+    .option('--live', 'AI modes: use the real Kite broker (requires KITE_LIVE=1)', false);
 
   const options = program.parse().opts();
 
@@ -551,9 +605,15 @@ async function main() {
 
   // --dry-run never runs live code; paper broker + simulated feed only.
   try {
-    await initialize(options.mode, { dryRun: options.dryRun });
+    await initialize(options.mode, { dryRun: options.dryRun, live: options.live });
 
     switch (options.mode) {
+      case 'ai':
+        await runAiDecide();
+        break;
+      case 'check':
+        await runAiCheck();
+        break;
       case 'paper':
         await runPaperTrading();
         break;

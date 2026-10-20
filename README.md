@@ -2,6 +2,8 @@
 
 A production-ready, modular, event-driven algorithmic trading framework built with Node.js. Supports backtesting, paper trading, and live trading via broker APIs.
 
+**New here? Start with [docs/usage.md](docs/usage.md)** — the complete how-to-use guide (commands, strategies, configuration, data, state). The AI trading agent has its own runbook: [docs/ai-agent-ops.md](docs/ai-agent-ops.md).
+
 ## Features
 
 - **Event-Driven Architecture**: Central event bus for inter-module communication

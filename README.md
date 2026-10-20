@@ -182,6 +182,18 @@ For Kite Connect (Zerodha):
    ```
 3. Run: `node src/app.js --mode live`
 
+## AI Trading Agent
+
+One Gemini decision per trading morning, executed through Kite, paper-first
+and long-only. Commands: `npm run ai:decide` (morning decisions),
+`npm run ai:check` (stop checks), `npm run ai:eod` (end-of-day square-off).
+`npm run ai:live` is intentionally disabled until broker-side fills are
+reconciled into the ledger — paper mode exercises every safety rail.
+
+See **[docs/ai-agent-ops.md](docs/ai-agent-ops.md)** for the full runbook:
+environment variables, cron setup, paper-first protocol, kill switch, and the
+honest caveats you must read before going live.
+
 ## Logs
 
 Logs are stored in `logs/` with daily rotation:

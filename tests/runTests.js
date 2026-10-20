@@ -11,19 +11,31 @@ import BreakoutStrategy from '../src/strategies/breakoutStrategy.js';
 import Backtester from '../src/backtest/backtester.js';
 import { loadDataFromFile } from '../src/data/sampleData.js';
 import { calculatePerformanceMetrics } from '../src/backtest/performance.js';
+import PaperBroker from '../src/brokers/paperBroker.js';
+import OrderManager from '../src/execution/orderManager.js';
+import PositionMonitor from '../src/execution/positionMonitor.js';
+import config from '../src/core/config.js';
+import { eventBus } from '../src/core/eventBus.js';
+import aiGate from '../src/ai/aiGate.js';
+import { TradeRepository } from '../src/storage/tradeRepository.js';
+import aiJournal from '../src/ai/journal.js';
+import quotes from '../src/ai/quotes.js';
+import marketBrief from '../src/ai/marketBrief.js';
+import llmAdvisor from '../src/ai/llmAdvisor.js';
+import totp from '../src/ai/totp.js';
+import KiteBroker from '../src/brokers/kiteBroker.js';
+import aiRunner from '../src/ai/aiRunner.js';
+import fs from 'fs';
 
 let passed = 0;
 let failed = 0;
 
+// Tests are collected first, then run sequentially with await, so async test
+// functions are actually awaited before they are reported or the summary prints.
+const pendingTests = [];
+
 function test(name, fn) {
-  try {
-    fn();
-    logger.info(`✓ ${name}`);
-    passed++;
-  } catch (error) {
-    logger.error(`✗ ${name}: ${error.message}`);
-    failed++;
-  }
+  pendingTests.push({ name, fn });
 }
 
 function assert(condition, message) {
@@ -176,15 +188,588 @@ test('Performance metrics calculates correctly', () => {
   assert(metrics.totalReturnPercent !== undefined, 'No return');
 });
 
+// Test Broker Ledger
+logger.info('\n=== Testing Broker Ledger ===\n');
+
+// Deterministic fills for ledger tests.
+config.set('paperTrading.simulateDelay', false);
+config.set('paperTrading.simulateSlippage', false);
+
+test('PaperBroker exposes normalized positions', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  await b.placeOrder({ id: 'o1', symbol: 'RELIANCE', side: 'BUY', quantity: 10, entryPrice: 2500 });
+
+  const list = await b.getPositions();
+  assert(list.length === 1, `expected 1 position, got ${list.length}`);
+  assert(list[0].symbol === 'RELIANCE' && list[0].side === 'BUY', 'wrong symbol/side');
+  assert(list[0].quantity === 10 && list[0].avgPrice === 2500, `wrong qty/avg: ${JSON.stringify(list[0])}`);
+
+  const one = await b.getPosition('RELIANCE');
+  assert(one && one.quantity === 10, 'getPosition returned wrong position');
+  assert((await b.getPosition('NOPE')) === null, 'expected null when flat');
+});
+
+test('PaperBroker reports fill effect and realized PnL', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  await b.placeOrder({ id: 'o1', symbol: 'X', side: 'BUY', quantity: 10, entryPrice: 100 });
+
+  const r1 = await b.placeOrder({ id: 'o2', symbol: 'X', side: 'SELL', quantity: 4, entryPrice: 110 });
+  assert(r1.action === 'REDUCE' && r1.closedQuantity === 4, `expected REDUCE/4, got ${r1.action}/${r1.closedQuantity}`);
+  assert(Math.abs(r1.realizedPnL - 40) < 1e-9, `expected pnl 40, got ${r1.realizedPnL}`);
+  assert((await b.getPosition('X')).quantity === 6, 'remaining qty should be 6');
+
+  const r2 = await b.placeOrder({ id: 'o3', symbol: 'X', side: 'SELL', quantity: 6, entryPrice: 90 });
+  assert(r2.action === 'CLOSE', `expected CLOSE, got ${r2.action}`);
+  assert(Math.abs(r2.realizedPnL - (-60)) < 1e-9, `expected pnl -60, got ${r2.realizedPnL}`);
+  assert((await b.getPosition('X')) === null, 'should be flat');
+
+  const r3 = await b.placeOrder({ id: 'o4', symbol: 'X', side: 'SELL', quantity: 5, entryPrice: 100 });
+  assert(r3.action === 'OPEN', `expected OPEN, got ${r3.action}`);
+});
+
+test('OrderManager mirrors broker positions and PnL', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+
+  const o1 = om.createOrder(
+    { symbol: 'Y', action: 'BUY', entryPrice: 200, stopLoss: 190, target: 220, strategy: 'T' },
+    5
+  );
+  await om.executeOrder(o1.id);
+
+  assert(om.getPositions().length === 1, `mirror should have 1, got ${om.getPositions().length}`);
+  const merged = om.getPosition('Y');
+  assert(merged && merged.stopLoss === 190 && merged.target === 220, 'exit levels should be merged');
+  assert(merged.quantity === 5 && merged.avgPrice === 200, 'broker position values should flow through');
+
+  const closeResult = await om.closePositionViaBroker('Y', 210, 'Target');
+  assert(closeResult && closeResult.success, 'close should succeed');
+  assert(om.getPositions().length === 0, 'mirror should be flat');
+  assert(om.getPosition('Y') === null, 'exit level should be cleared');
+
+  const brokerPnL = (await b.getAccountBalance()).totalPnL;
+  assert(
+    Math.abs(om.getPnL().realized - brokerPnL) < 1e-6,
+    `PnL parity: om=${om.getPnL().realized} broker=${brokerPnL}`
+  );
+});
+
+test('PositionMonitor closes via the broker on stop-loss', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+  const mon = new PositionMonitor(om);
+  mon.start();
+
+  const o = om.createOrder(
+    { symbol: 'Z', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' },
+    10
+  );
+  await om.executeOrder(o.id);
+  assert(om.getPositions().length === 1, 'should be open before the stop is hit');
+
+  eventBus.emitSafe('market_tick', { symbol: 'Z', price: 94, timestamp: Date.now() });
+  await new Promise(r => setTimeout(r, 50));
+
+  assert(om.getPositions().length === 0, 'order manager should be flat');
+  assert((await b.getPositions()).length === 0, 'broker should be flat');
+  mon.stop();
+});
+
+test('FLIP records the remainder in the trade journal, not the full order qty', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+
+  const o1 = om.createOrder({ symbol: 'F', action: 'BUY', entryPrice: 100, strategy: 'T' }, 4);
+  await om.executeOrder(o1.id);
+  const o2 = om.createOrder({ symbol: 'F', action: 'SELL', entryPrice: 110, strategy: 'T' }, 10);
+  await om.executeOrder(o2.id);
+
+  const broker = await b.getPosition('F');
+  assert(broker.side === 'SELL' && broker.quantity === 6, `broker should hold SELL 6, got ${broker.side} ${broker.quantity}`);
+
+  const open = om.getTradeHistory(50).filter(t => t.status === 'OPEN');
+  assert(open.length === 1, `expected exactly 1 OPEN trade, got ${open.length}`);
+  assert(open[0].side === 'SELL', `OPEN trade should be SELL, got ${open[0].side}`);
+  assert(open[0].quantity === 6, `journal qty must match broker remainder 6, got ${open[0].quantity}`);
+
+  // Closing the remainder must fully settle the journal: no stale OPEN record.
+  await om.closePositionViaBroker('F', 105, 'Exit');
+  assert((await b.getPosition('F')) === null, 'broker should be flat');
+  const stillOpen = om.getTradeHistory(50).filter(t => t.status === 'OPEN');
+  assert(stillOpen.length === 0, `journal must have no OPEN trades when flat, got ${stillOpen.length}`);
+});
+
+test('partial closing fill re-arms the exit guard', async () => {
+  // Stub broker that always fills only 4 units of a closing order.
+  const stub = {
+    name: 'stub',
+    position: null,
+    async connect() { return true; },
+    async getPositions() { return this.position ? [{ ...this.position }] : []; },
+    async getPosition(symbol) {
+      return this.position && this.position.symbol === symbol ? { ...this.position } : null;
+    },
+    async placeOrder(order) {
+      if (!this.position) {
+        this.position = {
+          symbol: order.symbol, side: order.side, quantity: order.quantity,
+          avgPrice: order.entryPrice, currentPrice: order.entryPrice, unrealizedPnL: 0,
+        };
+        return { success: true, fillPrice: order.entryPrice, quantity: order.quantity,
+          orderId: order.id, action: 'OPEN', realizedPnL: 0, closedQuantity: 0 };
+      }
+      if (order.side !== this.position.side) {
+        const closedQty = Math.min(4, this.position.quantity);
+        const pnl = this.position.side === 'BUY'
+          ? (order.entryPrice - this.position.avgPrice) * closedQty
+          : (this.position.avgPrice - order.entryPrice) * closedQty;
+        this.position.quantity -= closedQty;
+        const action = this.position.quantity <= 0 ? 'CLOSE' : 'REDUCE';
+        if (this.position.quantity <= 0) this.position = null;
+        return { success: true, fillPrice: order.entryPrice, quantity: closedQty,
+          orderId: order.id, action, realizedPnL: pnl, closedQuantity: closedQty };
+      }
+      this.position.quantity += order.quantity;
+      return { success: true, fillPrice: order.entryPrice, quantity: order.quantity,
+        orderId: order.id, action: 'ADD', realizedPnL: 0, closedQuantity: 0 };
+    },
+  };
+
+  const om = new OrderManager(stub);
+  const o1 = om.createOrder(
+    { symbol: 'P', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' },
+    10
+  );
+  await om.executeOrder(o1.id);
+
+  const c1 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c1?.success, 'first close should succeed');
+  const after = om.getPosition('P');
+  assert(after && after.quantity === 6, `remainder should be 6, got ${after?.quantity}`);
+  assert(after.exiting === false, `exit guard must be re-armed after a partial fill, got exiting=${after.exiting}`);
+
+  // A later stop tick must still be able to exit the remaining units.
+  const c2 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c2 !== null, 'second close must not be blocked by a stale exiting flag');
+  const afterSecond = await stub.getPosition('P');
+  assert(afterSecond && afterSecond.quantity === 2, `stub fills 4/close: 6 -> 2, got ${afterSecond?.quantity}`);
+
+  // ...and the guard re-arms again, so the last 2 units can still be exited.
+  const c3 = await om.closePositionViaBroker('P', 95, 'Stop Loss');
+  assert(c3 !== null, 'third close must not be blocked');
+  assert((await stub.getPosition('P')) === null, 'broker should be flat after third close');
+});
+
+test('closed trade keeps its exit reason', async () => {
+  const b = new PaperBroker(100000);
+  await b.connect();
+  const om = new OrderManager(b);
+  const o1 = om.createOrder({ symbol: 'R', action: 'BUY', entryPrice: 100, stopLoss: 95, target: 110, strategy: 'T' }, 5);
+  await om.executeOrder(o1.id);
+
+  await om.closePositionViaBroker('R', 95, 'Stop Loss');
+  const closed = om.getTradeHistory(50).find(t => t.symbol === 'R' && t.status === 'CLOSED');
+  assert(closed, 'expected a closed trade');
+  assert(closed.exitReason === 'Stop Loss', `exitReason must be preserved, got ${closed.exitReason}`);
+});
+
+// Test runner behaviour
+logger.info('\n=== Testing Test Runner ===\n');
+
+let asyncValue = null;
+test('runner awaits async tests', async () => {
+  await new Promise(r => setTimeout(r, 20));
+  asyncValue = 42;
+});
+test('async value is set once awaited', () => {
+  assert(asyncValue === 42, `expected 42, got ${asyncValue}`);
+});
+
+// AI agent config
+logger.info('\n=== Testing AI Agent Config ===\n');
+
+test('ai config block has defaults and is settable', () => {
+  assert(config.get('ai.dailyBudget') === 1000, 'default budget');
+  assert(config.get('ai.maxTrades') === 2, 'default maxTrades');
+  assert(config.get('ai.llm.model') === 'gemini-2.0-flash', 'default model');
+  config.set('ai.dailyBudget', 5000);
+  assert(config.get('ai.dailyBudget') === 5000, 'settable');
+  config.set('ai.dailyBudget', 1000); // restore for other tests
+});
+
+// AI gate
+logger.info('\n=== Testing AI Gate ===\n');
+
+test('aiGate rejects SELL and accepts a valid BUY with computed qty', () => {
+  const { validateDecisions } = aiGate;
+  const quotes = { TCS: { ltp: 400, prevClose: 395 } };
+  const r = validateDecisions({
+    decisions: [
+      { action: 'SELL', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'x' },
+      { action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'y' },
+    ],
+    quotes, spentToday: 0, openLots: [],
+  });
+  assert(r.rejected.length === 1 && /SELL/.test(r.rejected[0].reason), 'SELL rejected');
+  // budget 1000 * leverage 5 = 5000 -> floor(5000/400) = 12 shares
+  assert(r.accepted[0].quantity === 12, `qty should be 12, got ${r.accepted[0].quantity}`);
+  assert(Math.abs(r.accepted[0].spend - 4800) < 1e-9, 'spend = qty * ltp');
+});
+
+test('aiGate rejects bad SL, unknown symbol, budget blowout, and oversize qty', () => {
+  const quotes = { A: { ltp: 100, prevClose: 99 }, B: { ltp: 100000, prevClose: 99000 } };
+  const d = (over) => ({ action: 'BUY', symbol: 'A', product: 'CNC', entry: 100, stopLoss: 95, target: 110, confidence: 0.9, rationale: 'r', ...over });
+  const r = aiGate.validateDecisions({
+    decisions: [
+      d({ stopLoss: 105 }),                       // SL >= entry
+      d({ symbol: 'ZZZ' }),                       // unknown
+      d({}), d({}), d({}), d({}),                 // 6 valid -> exceeds maxTrades 2
+      d({ symbol: 'B', product: 'MIS' }),         // 1000*5/100000 = 0 shares
+    ],
+    quotes, spentToday: 950, openLots: [],
+  });
+  const reasons = r.rejected.map(x => x.reason).join('|');
+  assert(/stop-loss/.test(reasons), 'SL rule');
+  assert(/watchlist/.test(reasons), 'symbol rule');
+  assert(/max trades/.test(reasons), 'trade count rule');
+  assert(/afford/.test(reasons), 'min qty rule');
+});
+
+test('aiGate blocks duplicate symbols and stays within remaining budget', () => {
+  const quotes = { X: { ltp: 300, prevClose: 290 } };
+  const d = { action: 'BUY', symbol: 'X', product: 'CNC', entry: 300, stopLoss: 290, target: 320, confidence: 0.7, rationale: 'r' };
+  const r = aiGate.validateDecisions({ decisions: [d], quotes, spentToday: 0, openLots: [{ symbol: 'X', quantity: 2 }] });
+  assert(r.accepted.length === 0 && /already holding/.test(r.rejected[0].reason), 'duplicate rejected');
+  const r2 = aiGate.validateDecisions({ decisions: [d], quotes, spentToday: 900, openLots: [] });
+  assert(r2.accepted.length === 0 && /budget/.test(r2.rejected[0].reason), 'budget left 100 < 300');
+});
+
+// AI ledger
+logger.info('\n=== Testing AI Ledger ===\n');
+
+test('ai ledger tracks margin spend, open lots, and sell-guard quantities', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 12, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 5, price: 410, product: 'MIS', kiteOrderId: 'k2', reason: 'stop' });
+  // margin semantics: 12 * 400 / 5 (MIS leverage) = 960; sale proceeds never refill
+  assert(repo.getSpendToday() === 960, `margin spend should be 960, got ${repo.getSpendToday()}`);
+  const lots = repo.getOpenAiLots();
+  assert(lots.length === 1 && lots[0].quantity === 7, `open lot qty 7, got ${JSON.stringify(lots)}`);
+  const one = repo.getOpenAiLot('TCS');
+  assert(one && one.quantity === 7, 'per-symbol lot');
+  assert(repo.getOpenAiLot('INFY') === null, 'unknown symbol -> null');
+});
+
+// AI journal
+logger.info('\n=== Testing AI Journal ===\n');
+
+test('journal appends readable entries per day', () => {
+  const date = '2026-10-19';
+  const { append, read } = aiJournal;
+  append(date, { type: 'DECISION', data: { symbol: 'TCS', confidence: 0.8 } });
+  append(date, { type: 'REJECTED', data: { symbol: 'X', reason: 'max trades' } });
+  const text = read(date);
+  assert(text.includes('[DECISION]') && text.includes('TCS'), 'decision line present');
+  assert(text.includes('[REJECTED]') && text.includes('max trades'), 'rejection line present');
+  assert(/^- \d{2}:\d{2} \[DECISION\]/m.test(text), 'timestamped line format');
+});
+
+// Quote provider
+logger.info('\n=== Testing Quote Provider ===\n');
+
+test('quotes falls back to yfinance when kite is unavailable', async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return {
+      ok: true,
+      json: async () => ({
+        quoteResponse: { result: [
+          { symbol: 'TCS.NS', regularMarketPrice: 405.5, regularMarketPreviousClose: 400 },
+        ] },
+      }),
+    };
+  };
+  const r = await quotes.getQuotes(['TCS'], { kiteBroker: null, fetchFn });
+  assert(calls.some(u => u.includes('TCS.NS')), 'yahoo endpoint called with .NS suffix');
+  assert(r.TCS.ltp === 405.5 && r.TCS.prevClose === 400, 'mapped to base symbol');
+  assert(Math.abs(r.TCS.changePct - 1.375) < 1e-9, 'changePct computed');
+});
+
+test('quotes omits symbols that fail everywhere', async () => {
+  const fetchFn = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  const r = await quotes.getQuotes(['TCS'], { kiteBroker: null, fetchFn });
+  assert(!r.TCS, 'failed symbol omitted');
+});
+
+// Market brief + LLM advisor
+logger.info('\n=== Testing Market Brief + LLM Advisor ===\n');
+
+test('buildBrief assembles budget, market rows, and instructions', () => {
+  const brief = marketBrief.buildBrief({
+    quotes: { TCS: { ltp: 405, prevClose: 400, changePct: 1.25 } },
+    symbols: ['TCS'], budget: 1000, spentToday: 0,
+    openLots: [], recentTrades: [{ symbol: 'INFY', pnl: -40, exitReason: 'Stop Loss' }],
+  });
+  assert(brief.budget === 1000 && brief.market.length === 1, 'budget + market rows');
+  assert(/empty/.test(brief.instructions) && /stop-loss/i.test(brief.instructions), 'instructions present');
+  assert(/MIS/.test(brief.instructions), 'leverage explained');
+});
+
+test('askAdvisor parses decisions and normalizes keys', async () => {
+  const body = { candidates: [{ content: { parts: [{ text: JSON.stringify({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'gap up' }],
+  }) }] } }] };
+  const fetchFn = async () => ({ ok: true, json: async () => body });
+  const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
+  assert(d.length === 1 && d[0].symbol === 'TCS' && d[0].stopLoss === 390, 'parsed and normalized');
+});
+
+test('askAdvisor returns null on repeated failure, never throws', async () => {
+  const fetchFn = async () => ({ ok: false, status: 429, json: async () => ({}) });
+  const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
+  assert(d === null, 'quota failure -> null (runner journals llm-error, distinct from a stand-down)');
+});
+
+// Kite plumbing
+logger.info('\n=== Testing Kite Plumbing ===\n');
+
+test('totp generates RFC 6238 test vector codes', () => {
+  const code = totp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 1111111109);
+  assert(code === '07081804', `RFC vector 8-digit, got ${code}`);
+});
+
+test('totp 6-digit variant for kite login', () => {
+  const code = totp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 1111111109, 6);
+  assert(code === '081804', `6-digit truncation, got ${code}`);
+});
+
+test('KiteBroker normalizes kite net positions', async () => {
+  const kb = new KiteBroker({});
+  kb.connected = true;
+  kb.kite = { async getPositions() { return { net: [
+    { tradingsymbol: 'TCS', quantity: 10, avg_price: 400, ltp: 405 },
+    { tradingsymbol: 'INFY', quantity: 0, avg_price: 0, ltp: 0 },
+  ] }; } };
+  const list = await kb.getPositions();
+  assert(list.length === 1, `flat rows omitted, got ${list.length}`);
+  assert(list[0].symbol === 'TCS' && list[0].unrealizedPnL === 50, `normalized: ${JSON.stringify(list[0])}`);
+});
+
+// AI decide runner
+logger.info('\n=== Testing AI Decide Runner ===\n');
+
+const yahooFetch = (ltp, prevClose) => async () => ({
+  ok: true,
+  json: async () => ({ quoteResponse: { result: [{ symbol: 'TCS.NS', regularMarketPrice: ltp, regularMarketPreviousClose: prevClose }] } }),
+});
+
+test('runDecide places gated buys, records fills, and attaches stops', async () => {
+  config.set('ai.dailyBudget', 1000);
+  const placed = [];
+  const stub = { name: 'stub', async isConnected() { return true; },
+    async placeOrder(o) { placed.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k9', action: 'OPEN', realizedPnL: 0, closedQuantity: 0 }; },
+    async placeStopLoss(sym, p) { placed.push({ slFor: sym, ...p }); return { success: true }; } };
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  const r = await aiRunner.runDecide({
+    broker: stub,
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'test' }],
+    repo,
+  });
+  assert(r.placed.length === 1 && placed.some(o => o.symbol === 'TCS' && o.strategy === 'ai-agent'), 'buy placed with tag');
+  assert(placed.some(o => o.slFor === 'TCS' && o.triggerPrice === 390), 'stop attached after fill');
+  assert(repo.getOpenAiLot('TCS').quantity === 12, 'fill recorded in ledger');
+  assert(aiJournal.read(new Date().toLocaleDateString('sv')).includes('[DECISION]'), 'journaled');
+  config.set('ai.dailyBudget', 1000);
+});
+
+test('runDecide skips when halted and spends only remaining budget on rerun', async () => {
+  fs.writeFileSync('data/TRADING_HALTED', '');
+  const r = await aiRunner.runDecide({ broker: { async isConnected() { return true; } }, askFn: async () => [] });
+  fs.unlinkSync('data/TRADING_HALTED');
+  assert(r.skipped && /halt/i.test(r.skipped), 'kill switch respected');
+
+  // ₹900 margin already committed today -> next BUY sizes from ₹100 left
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'INFY', side: 'BUY', quantity: 1, price: 900, product: 'CNC', kiteOrderId: 'k0', reason: 'ai' });
+  const placed = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { placed.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k10', action: 'OPEN', realizedPnL: 0, closedQuantity: 0 }; },
+    async placeStopLoss() { return { success: true }; } };
+  const r2 = await aiRunner.runDecide({
+    broker: stub,
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'test' }],
+    repo,
+  });
+  // budgetLeft 100 * MIS 5 = 500 -> floor(500/400) = 1 share
+  assert(placed.length === 1 && placed[0].quantity === 1, `qty from remaining margin, got ${placed[0]?.quantity}`);
+});
+
+test('runDecide skips when the daily loss limit is hit', () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 10, price: 400, product: 'CNC', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 10, price: 350, product: 'CNC', kiteOrderId: 'k2', reason: 'stop' });
+  return aiRunner.runDecide({ broker: { async isConnected() { return true; } }, askFn: async () => [], repo })
+    .then(r => assert(r.skipped && /loss/i.test(r.skipped), `loss limit respected, got ${r.skipped}`));
+});
+
+test('checkStops exits lots whose ltp hit the stop', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 5, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  const sold = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sold.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k77', action: 'CLOSE', realizedPnL: -25, closedQuantity: o.quantity }; } };
+  const r1 = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(395, 400), repo });
+  assert(r1.exited.length === 0, 'above stop: no exit');
+  const r2 = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(385, 400), repo });
+  assert(r2.exited.length === 1 && sold.length === 1 && sold[0].side === 'SELL' && sold[0].quantity === 5, 'stop hit: market sell');
+  assert(repo.getOpenAiLots().length === 0, 'lot closed in ledger');
+});
+
+// AI EOD runner
+logger.info('\n=== Testing AI EOD Runner ===\n');
+
+const tempRepoWithBuy = (symbol, qty, price) => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol, side: 'BUY', quantity: qty, price, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: Math.round(price * 0.97) });
+  return repo;
+};
+
+test('runEod squares off open ai lots and is idempotent', async () => {
+  const sells = [];
+  const stub = { name: 'stub', async isConnected() { return true; },
+    async placeOrder(o) { sells.push(o); return { success: true, fillPrice: 410, quantity: o.quantity, orderId: 'e1', action: 'CLOSE', realizedPnL: 120, closedQuantity: o.quantity }; } };
+  const repo = tempRepoWithBuy('TCS', 12, 400);
+  const r = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo, journal: aiJournal });
+  assert(sells.length === 1 && sells[0].side === 'SELL' && sells[0].quantity === 12, `sold 12 TCS, got ${JSON.stringify(sells)}`);
+  assert(repo.getOpenAiLots().length === 0, 'ledger flat');
+  assert(r.closed.length === 1 && r.closed[0].pnl === 120, `realized pnl journaled, got ${JSON.stringify(r.closed)}`);
+  const r2 = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo, journal: aiJournal });
+  assert(r2.closed.length === 0, 'second run is a no-op');
+});
+
+test('runEod keeps CNC lots overnight when eodExitEnabled is false', async () => {
+  config.set('ai.eodExitEnabled', false);
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 2, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'INFY', side: 'BUY', quantity: 1, price: 900, product: 'CNC', kiteOrderId: 'k2', reason: 'ai' });
+  const sells = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sells.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'e2', action: 'CLOSE', realizedPnL: 0, closedQuantity: o.quantity }; } };
+  await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(405, 400), repo });
+  assert(sells.length === 1 && sells[0].symbol === 'TCS', `MIS closed only, got ${JSON.stringify(sells)}`);
+  assert(repo.getOpenAiLots().length === 1, 'CNC lot held overnight');
+  config.set('ai.eodExitEnabled', true);
+});
+
+// Final review fix pass
+logger.info('\n=== Testing Review Fixes ===\n');
+
+test('gate rejects stops at or above the current market price', () => {
+  const { rejected } = aiGate.validateDecisions({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 405, stopLoss: 402, target: 420, confidence: 0.8 }],
+    quotes: { TCS: { ltp: 400, prevClose: 395 } },
+    spentToday: 0,
+    openLots: [],
+  });
+  assert(rejected.length === 1 && /below current market/.test(rejected[0].reason), `instant-stop rejected, got ${rejected[0]?.reason}`);
+});
+
+test('gate counts open lots against maxTrades', () => {
+  const { accepted, rejected } = aiGate.validateDecisions({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8 }],
+    quotes: { TCS: { ltp: 400, prevClose: 395 } },
+    spentToday: 0,
+    openLots: [{ symbol: 'INFY', quantity: 1 }, { symbol: 'HDFCBANK', quantity: 1 }],
+  });
+  assert(accepted.length === 0 && rejected.length === 1 && /max trades/.test(rejected[0].reason), `held lots consume the daily cap, got ${rejected[0]?.reason}`);
+});
+
+test('runDecide journals and skips when the LLM call fails', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  const r = await aiRunner.runDecide({
+    broker: { async isConnected() { return true; } },
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => null,
+    repo,
+  });
+  assert(r.skipped && /LLM/i.test(r.skipped), `llm failure skips, got ${r.skipped}`);
+  assert(aiJournal.read(new Date().toLocaleDateString('sv')).includes('llm-error'), 'journaled llm-error');
+});
+
+test('checkStops still enforces exits while the halt file is present', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 5, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  fs.writeFileSync('data/TRADING_HALTED', '');
+  const sold = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sold.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k88', action: 'CLOSE', realizedPnL: -25, closedQuantity: o.quantity }; } };
+  const r = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(385, 400), repo });
+  fs.unlinkSync('data/TRADING_HALTED');
+  assert(r.exited.length === 1 && sold.length === 1, 'halt never disables stop enforcement');
+});
+
+test('runEod prices exits at the market quote when the broker returns no fill price', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 12, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { return { success: true, quantity: o.quantity, orderId: 'e9' }; } }; // live-style: no fillPrice
+  const r = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo });
+  assert(r.closed.length === 1 && r.closed[0].pnl === 120, `pnl from market price, got ${JSON.stringify(r.closed)}`);
+  assert(repo.getRealizedToday() === 120, 'ledger records the real sell price');
+});
+
+test('realized PnL and open-lot averages use FIFO, not all-time averages', () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.db.prepare("INSERT INTO ai_ledger (symbol, side, quantity, price, product, day, stop_loss) VALUES ('TCS','BUY',10,400,'MIS','2026-01-01',390)").run();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 10, price: 500, product: 'MIS', kiteOrderId: 'k2', reason: 'ai', stopLoss: 485 });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 10, price: 480, product: 'MIS', kiteOrderId: 'k3', reason: 'stop' });
+  assert(repo.getRealizedToday() === 800, `today's sell matched the old 400 lot (+800), got ${repo.getRealizedToday()}`);
+  assert(repo.getOpenAiLots()[0].avgPrice === 500, `remaining lot avg is 500, got ${repo.getOpenAiLots()[0].avgPrice}`);
+  const exits = repo.getRecentExits(5);
+  assert(exits.length === 1 && exits[0].pnl === 800 && exits[0].exitReason === 'stop', `recent exits carry pnl for the LLM brief, got ${JSON.stringify(exits)}`);
+});
+
 // Summary
-logger.info('\n=== Test Summary ===\n');
-logger.info(`Passed: ${passed}`);
-logger.info(`Failed: ${failed}`);
-logger.info(`Total: ${passed + failed}`);
+(async () => {
+  for (const { name, fn } of pendingTests) {
+    try {
+      await fn();
+      logger.info(`✓ ${name}`);
+      passed++;
+    } catch (error) {
+      logger.error(`✗ ${name}: ${error.message}`);
+      failed++;
+    }
+  }
 
-if (failed > 0) {
-  process.exit(1);
-}
+  logger.info('\n=== Test Summary ===\n');
+  logger.info(`Passed: ${passed}`);
+  logger.info(`Failed: ${failed}`);
+  logger.info(`Total: ${passed + failed}`);
 
-logger.info('\n✓ All tests passed!\n');
-process.exit(0);
+  if (failed > 0) {
+    process.exit(1);
+  }
+
+  logger.info('\n✓ All tests passed!\n');
+  process.exit(0);
+})();

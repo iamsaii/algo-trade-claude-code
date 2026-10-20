@@ -27,6 +27,10 @@ class CandleBuilder extends EventEmitter {
    * Initialize with starting prices
    */
   initialize(startingPrices) {
+    // Re-read config so overrides applied after import are honoured.
+    this.symbols = config.get('market.symbols');
+    this.candleIntervalMs = config.get('market.candleIntervalMinutes') * 60 * 1000;
+
     this.symbols.forEach(symbol => {
       const price = startingPrices[symbol];
       this.currentCandles.set(symbol, this._createCandle(symbol, price));

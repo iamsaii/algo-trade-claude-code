@@ -17,9 +17,10 @@ class PaperBroker extends BaseBroker {
       delayMs: config.get('paperTrading.delayMs'),
     });
 
-    this.accountBalance = initialBalance;
+    this.accountBalance = initialBalance; // Realized cash equity (initial + realized PnL)
     this.initialBalance = initialBalance;
-    this.availableMargin = initialBalance;
+    this.availableMargin = initialBalance; // Free cash available for new positions
+    this.usedMargin = 0; // Notional reserved by open positions
     this.positions = new Map();
     this.orders = new Map();
     this.orderHistory = [];
@@ -54,75 +55,78 @@ class PaperBroker extends BaseBroker {
    * Place and execute an order
    */
   async placeOrder(order) {
-    return new Promise(async (resolve) => {
-      // Validate order
-      const validation = this.validateOrder(order);
-      if (!validation.valid) {
-        resolve({
-          success: false,
-          reason: validation.errors.join(', '),
-        });
-        return;
-      }
+    // Validate order
+    const validation = this.validateOrder(order);
+    if (!validation.valid) {
+      return { success: false, reason: validation.errors.join(', ') };
+    }
 
-      // Check available margin
+    // Margin is only required when opening/increasing a position, never when reducing it.
+    const isOpening = this._isOpeningOrder(order.side, order.symbol);
+    if (isOpening) {
       const requiredMargin = order.quantity * order.entryPrice;
       if (requiredMargin > this.availableMargin) {
-        resolve({
+        return {
           success: false,
           reason: `Insufficient margin. Required: ${requiredMargin.toFixed(2)}, Available: ${this.availableMargin.toFixed(2)}`,
-        });
-        return;
+        };
       }
+    }
 
-      // Simulate delay if configured
-      if (this.config.simulateDelay) {
-        await new Promise(r => setTimeout(r, this.config.delayMs));
-      }
+    // Simulate delay if configured
+    if (this.config.simulateDelay) {
+      await new Promise(r => setTimeout(r, this.config.delayMs));
+    }
 
-      // Calculate fill price with optional slippage
-      let fillPrice = order.entryPrice;
-      if (this.config.simulateSlippage) {
-        fillPrice = this._applySlippage(order.side, order.entryPrice);
-      }
+    // Calculate fill price with optional slippage
+    let fillPrice = order.entryPrice;
+    if (this.config.simulateSlippage) {
+      fillPrice = this._applySlippage(order.side, order.entryPrice);
+    }
 
-      // Calculate actual quantity based on available margin
-      const actualQuantity = order.quantity;
-      const totalValue = actualQuantity * fillPrice;
+    const actualQuantity = order.quantity;
 
-      // Update margin
-      this.availableMargin -= totalValue;
+    // Update position + margin/balance. This is where cash actually moves.
+    const effect = this._updatePosition(order.side, order.symbol, fillPrice, actualQuantity);
 
-      // Update or create position
-      this._updatePosition(order.side, order.symbol, fillPrice, actualQuantity);
+    // Store order
+    const filledOrder = {
+      ...order,
+      fillPrice,
+      quantity: actualQuantity,
+      status: 'FILLED',
+      filledAt: Date.now(),
+    };
+    this.orders.set(order.id, filledOrder);
+    this.orderHistory.push(filledOrder);
 
-      // Store order
-      const filledOrder = {
-        ...order,
-        fillPrice,
-        quantity: actualQuantity,
-        status: 'FILLED',
-        filledAt: Date.now(),
-      };
-      this.orders.set(order.id, filledOrder);
-      this.orderHistory.push(filledOrder);
-
-      logger.info('Paper order filled', {
-        orderId: order.id,
-        symbol: order.symbol,
-        side: order.side,
-        quantity: actualQuantity,
-        fillPrice,
-        slippage: ((fillPrice - order.entryPrice) / order.entryPrice * 100).toFixed(3) + '%',
-      });
-
-      resolve({
-        success: true,
-        fillPrice,
-        quantity: actualQuantity,
-        orderId: order.id,
-      });
+    logger.info('Paper order filled', {
+      orderId: order.id,
+      symbol: order.symbol,
+      side: order.side,
+      quantity: actualQuantity,
+      fillPrice,
+      slippage: ((fillPrice - order.entryPrice) / order.entryPrice * 100).toFixed(3) + '%',
     });
+
+    return {
+      success: true,
+      fillPrice,
+      quantity: actualQuantity,
+      orderId: order.id,
+      action: effect.action,
+      realizedPnL: effect.realizedPnL,
+      closedQuantity: effect.closedQuantity,
+    };
+  }
+
+  /**
+   * An order opens/increases exposure when there is no position, or the order
+   * is on the same side as the existing position. Opposite-side orders reduce.
+   */
+  _isOpeningOrder(side, symbol) {
+    const existing = this.positions.get(symbol);
+    return !existing || existing.side === side;
   }
 
   /**
@@ -142,32 +146,46 @@ class PaperBroker extends BaseBroker {
   }
 
   /**
-   * Update position after order fill
+   * Update position after an order fill. Routes to open (add) or close based
+   * on the incoming side versus any existing position, and handles flips.
+   * Returns the fill effect: { action, realizedPnL, closedQuantity }.
+   *   action = OPEN | ADD | REDUCE | CLOSE | FLIP
    */
   _updatePosition(side, symbol, price, quantity) {
     const existing = this.positions.get(symbol);
 
-    if (side === 'BUY') {
-      if (existing && existing.side === 'SELL') {
-        // Closing short position
-        this._closePosition(symbol, price, quantity, 'SELL');
-      } else {
-        // Opening or adding to long
-        this._addToPosition(symbol, 'BUY', price, quantity);
-      }
-    } else {
-      if (existing && existing.side === 'BUY') {
-        // Closing long position
-        this._closePosition(symbol, price, quantity, 'BUY');
-      } else {
-        // Opening or adding to short
-        this._addToPosition(symbol, 'SELL', price, quantity);
-      }
+    if (!existing) {
+      this._addToPosition(symbol, side, price, quantity);
+      return { action: 'OPEN', realizedPnL: 0, closedQuantity: 0 };
     }
+
+    if (existing.side === side) {
+      this._addToPosition(symbol, side, price, quantity);
+      return { action: 'ADD', realizedPnL: 0, closedQuantity: 0 };
+    }
+
+    // Opposite side -> reduce/close, then open the remainder (if any).
+    const existingQuantity = existing.quantity;
+    const closed = this._closePosition(symbol, price, quantity);
+    const closedQuantity = closed?.quantity || 0;
+    const realizedPnL = closed?.pnl || 0;
+    const remainder = quantity - closedQuantity;
+
+    if (remainder > 0) {
+      // Order was larger than the position: flip to the opposite side.
+      this._addToPosition(symbol, side, price, remainder);
+      return { action: 'FLIP', realizedPnL, closedQuantity };
+    }
+
+    return {
+      action: closedQuantity < existingQuantity ? 'REDUCE' : 'CLOSE',
+      realizedPnL,
+      closedQuantity,
+    };
   }
 
   /**
-   * Add to existing position or create new
+   * Add to existing position or create new. Reserves notional margin.
    */
   _addToPosition(symbol, side, price, quantity) {
     const existing = this.positions.get(symbol);
@@ -187,29 +205,34 @@ class PaperBroker extends BaseBroker {
         unrealizedPnL: 0,
       });
     }
+
+    // Reserve cash for the newly opened notional.
+    const notional = price * quantity;
+    this.usedMargin += notional;
+    this.availableMargin -= notional;
+
+    return { action: 'OPENED', symbol, side, price, quantity };
   }
 
   /**
-   * Close position
+   * Reduce/close a position. Releases the reserved notional plus realized PnL
+   * back to available cash. PnL is always derived from the position's own side.
    */
-  _closePosition(symbol, exitPrice, quantity, closingSide) {
+  _closePosition(symbol, exitPrice, quantity) {
     const position = this.positions.get(symbol);
-    if (!position) return;
+    if (!position) return null;
 
     const closeQuantity = Math.min(quantity, position.quantity);
-    let pnl;
+    const entryNotional = position.avgPrice * closeQuantity;
 
-    if (closingSide === 'BUY') {
-      // Closing short position
-      pnl = (position.avgPrice - exitPrice) * closeQuantity;
-    } else {
-      // Closing long position
-      pnl = (exitPrice - position.avgPrice) * closeQuantity;
-    }
+    const pnl = position.side === 'BUY'
+      ? (exitPrice - position.avgPrice) * closeQuantity
+      : (position.avgPrice - exitPrice) * closeQuantity;
 
-    // Update balance with PnL
+    // Cash movements: return the reserved notional and add the realized PnL.
     this.accountBalance += pnl;
-    this.availableMargin += pnl;
+    this.usedMargin -= entryNotional;
+    this.availableMargin += entryNotional + pnl;
 
     // Update or remove position
     position.quantity -= closeQuantity;
@@ -219,9 +242,14 @@ class PaperBroker extends BaseBroker {
 
     logger.info('Position closed', {
       symbol,
+      side: position.side,
+      quantity: closeQuantity,
+      exitPrice,
       pnl: pnl.toFixed(2),
-      pnlPercent: ((pnl / (position.avgPrice * closeQuantity)) * 100).toFixed(2) + '%',
+      pnlPercent: ((pnl / entryNotional) * 100).toFixed(2) + '%',
     });
+
+    return { action: 'CLOSED', symbol, side: position.side, exitPrice, quantity: closeQuantity, pnl };
   }
 
   /**
@@ -245,10 +273,33 @@ class PaperBroker extends BaseBroker {
   }
 
   /**
-   * Get position for a symbol
+   * Get all open positions in the normalized broker shape.
+   * Contract: { symbol, side, quantity, avgPrice, currentPrice, unrealizedPnL }
+   */
+  async getPositions() {
+    return Array.from(this.positions.values())
+      .filter(p => p.quantity > 0)
+      .map(p => this._normalizePosition(p));
+  }
+
+  /**
+   * Get position for a symbol (normalized), or null when flat.
    */
   async getPosition(symbol) {
-    return this.positions.get(symbol) || null;
+    const position = this.positions.get(symbol);
+    if (!position || position.quantity <= 0) return null;
+    return this._normalizePosition(position);
+  }
+
+  _normalizePosition(p) {
+    return {
+      symbol: p.symbol,
+      side: p.side,
+      quantity: p.quantity,
+      avgPrice: p.avgPrice,
+      currentPrice: p.currentPrice,
+      unrealizedPnL: p.unrealizedPnL,
+    };
   }
 
   /**
@@ -258,7 +309,7 @@ class PaperBroker extends BaseBroker {
     return {
       totalBalance: this.accountBalance,
       availableMargin: this.availableMargin,
-      usedMargin: this.initialBalance - this.availableMargin,
+      usedMargin: this.usedMargin,
       initialBalance: this.initialBalance,
       totalPnL: this.accountBalance - this.initialBalance,
     };
@@ -268,7 +319,7 @@ class PaperBroker extends BaseBroker {
    * Get all holdings/positions
    */
   async getHoldings() {
-    return Array.from(this.positions.values());
+    return this.getPositions();
   }
 
   /**
@@ -331,6 +382,7 @@ class PaperBroker extends BaseBroker {
   reset(newBalance = null) {
     this.accountBalance = newBalance || this.initialBalance;
     this.availableMargin = this.accountBalance;
+    this.usedMargin = 0;
     this.positions.clear();
     this.orders.clear();
     this.orderHistory = [];

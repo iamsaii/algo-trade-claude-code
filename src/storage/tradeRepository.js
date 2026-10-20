@@ -10,10 +10,15 @@ import fs from 'fs';
 import logger from '../utils/logger.js';
 import config from '../core/config.js';
 
+/** Local calendar date YYYY-MM-DD — the one definition of "today". */
+export function todayStr() {
+  return new Date().toLocaleDateString('sv');
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-class TradeRepository {
+export class TradeRepository {
   constructor(dbPath = null) {
     this.dbPath = dbPath || config.get('database.path');
 
@@ -123,6 +128,32 @@ class TradeRepository {
         created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
+
+    // AI agent ledger: the sell-guard source of truth. The agent may
+    // only ever sell what it has bought and recorded here.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        price REAL NOT NULL,
+        product TEXT,
+        kite_order_id TEXT,
+        reason TEXT,
+        day TEXT NOT NULL,
+        stop_loss REAL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+
+    // Migration for databases created before the stop_loss column existed
+    // (SQLite has no ADD COLUMN IF NOT EXISTS).
+    try {
+      this.db.exec('ALTER TABLE ai_ledger ADD COLUMN stop_loss REAL');
+    } catch (e) {
+      // column already exists — expected on every run after the first
+    }
 
     // Create indexes for better query performance
     this.db.exec(`
@@ -472,6 +503,140 @@ class TradeRepository {
       logger.error('Failed to save portfolio snapshot', { error: error.message });
       return false;
     }
+  }
+
+  /**
+   * Record an AI agent fill (buy or sell) in the agent's own ledger.
+   * Thrown errors must propagate: an unrecorded fill would break the
+   * sell-guard, so the caller must never continue past this silently.
+   */
+  recordAiFill({ symbol, side, quantity, price, product = null, kiteOrderId = null, reason = null, stopLoss = null }) {
+    const stmt = this.db.prepare(`
+      INSERT INTO ai_ledger (symbol, side, quantity, price, product, kite_order_id, reason, day, stop_loss)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const info = stmt.run(symbol, side, quantity, price, product, kiteOrderId, reason, todayStr(), stopLoss);
+    return info.lastInsertRowid;
+  }
+
+  /**
+   * Margin rupees consumed today: buys count quantity*price/leverage
+   * (MIS leveraged, CNC full); sale proceeds never refill the budget.
+   */
+  getSpendToday() {
+    const misLeverage = config.get('ai.misLeverage');
+    const rows = this.db.prepare(
+      "SELECT quantity, price, product FROM ai_ledger WHERE day = ? AND side = 'BUY'"
+    ).all(todayStr());
+    return rows.reduce((sum, r) => {
+      const leverage = r.product === 'MIS' ? misLeverage : 1;
+      return sum + (r.quantity * r.price) / leverage;
+    }, 0);
+  }
+
+  /**
+   * FIFO walk of the whole AI ledger per symbol: each sell is matched
+   * to the oldest unmatched buys, so prior-day lots never pollute
+   * today's realized P&L or an open lot's average price. Returns
+   * { open: Map<symbol, {quantity, avgPrice, stopLoss, product}>,
+   *   sells: [{symbol, quantity, day, pnl, reason}] } in rowid order.
+   */
+  _fifoWalk() {
+    const rows = this.db.prepare(
+      'SELECT symbol, side, quantity, price, product, stop_loss, reason, day FROM ai_ledger ORDER BY rowid'
+    ).all();
+    const queues = new Map(); // symbol -> unmatched buy lots [{qty, price, stopLoss, product}]
+    const sells = [];
+    for (const r of rows) {
+      let q = queues.get(r.symbol);
+      if (!q) { q = []; queues.set(r.symbol, q); }
+      if (r.side === 'BUY') {
+        q.push({ qty: r.quantity, price: r.price, stopLoss: r.stop_loss, product: r.product });
+        continue;
+      }
+      let remaining = r.quantity;
+      let pnl = 0;
+      while (remaining > 0 && q.length) {
+        const lot = q[0];
+        const take = Math.min(lot.qty, remaining);
+        pnl += (r.price - lot.price) * take;
+        lot.qty -= take;
+        remaining -= take;
+        if (lot.qty === 0) q.shift();
+      }
+      // Unmatched remainder (sell without buys on record) contributes 0.
+      sells.push({ symbol: r.symbol, quantity: r.quantity, day: r.day, pnl, reason: r.reason });
+    }
+    const open = new Map();
+    for (const [symbol, q] of queues) {
+      const qty = q.reduce((s, l) => s + l.qty, 0);
+      if (qty <= 0) continue;
+      const amount = q.reduce((s, l) => s + l.qty * l.price, 0);
+      const stops = q.map(l => l.stopLoss).filter(v => typeof v === 'number');
+      open.set(symbol, {
+        quantity: qty,
+        avgPrice: amount / qty,
+        stopLoss: stops.length ? Math.min(...stops) : null,
+        product: q[q.length - 1].product,
+      });
+    }
+    return { open, sells };
+  }
+
+  /**
+   * Net open AI lots (FIFO-unmatched buys).
+   * stopLoss = lowest unmatched buy stop, product = last unmatched
+   * buy's product (the gate blocks same-symbol re-buys while a lot is
+   * open, so both are unambiguous in practice).
+   */
+  getOpenAiLots() {
+    return [...this._fifoWalk().open.entries()].map(([symbol, o]) => ({
+      symbol,
+      quantity: o.quantity,
+      stopLoss: o.stopLoss,
+      product: o.product,
+      avgPrice: o.avgPrice,
+    }));
+  }
+
+  /**
+   * Realized PnL from today's AI sells, FIFO-matched against the full
+   * ledger — today's kill switch never sees yesterday's trades.
+   */
+  getRealizedToday() {
+    return this._fifoWalk()
+      .sells.filter(s => s.day === todayStr())
+      .reduce((sum, s) => sum + s.pnl, 0);
+  }
+
+  /**
+   * Most recent AI exits with realized PnL, for the LLM brief's
+   * feedback loop. Newest last.
+   */
+  getRecentExits(n = 5) {
+    return this._fifoWalk().sells.slice(-n).map(s => ({ symbol: s.symbol, pnl: s.pnl, exitReason: s.reason }));
+  }
+
+  /**
+   * Open lot for one symbol with weighted-average buy price, or null.
+   */
+  getOpenAiLot(symbol) {
+    const rows = this.db.prepare(
+      'SELECT side, quantity, price FROM ai_ledger WHERE symbol = ?'
+    ).all(symbol);
+    if (!rows.length) return null;
+    let qty = 0;
+    let buyQty = 0;
+    let buyAmount = 0;
+    for (const r of rows) {
+      if (r.side === 'BUY') {
+        buyQty += r.quantity;
+        buyAmount += r.quantity * r.price;
+      }
+      qty += r.side === 'BUY' ? r.quantity : -r.quantity;
+    }
+    if (qty <= 0) return null;
+    return { symbol, quantity: qty, avgPrice: buyQty > 0 ? buyAmount / buyQty : 0 };
   }
 
   /**

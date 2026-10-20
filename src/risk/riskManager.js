@@ -19,21 +19,14 @@ class RiskManager extends EventEmitter {
   constructor() {
     super();
 
-    // Trading limits from config
-    this.initialCapital = config.get('trading.initialCapital');
-    this.currentCapital = this.initialCapital;
-    this.maxRiskPerTrade = config.get('trading.maxRiskPerTrade');
-    this.maxDailyLoss = config.get('trading.maxDailyLoss');
-    this.maxOpenTrades = config.get('trading.maxOpenTrades');
-    this.defaultStopLoss = config.get('trading.defaultStopLoss');
-    this.defaultTarget = config.get('trading.defaultTarget');
-
-    // State tracking
-    this.openTrades = [];
+    // Config-derived limits are read lazily via getters, so runtime overrides
+    // (--capital, env vars) applied after this module is imported are honoured.
+    // currentCapital is seeded on first use, once config is fully applied.
+    this.currentCapital = null;
+    this.peakCapital = null;
     this.dailyPnL = 0;
     this.dailyTrades = 0;
     this.totalPnL = 0;
-    this.peakCapital = this.initialCapital;
     this.currentDrawdown = 0;
     this.maxDrawdown = 0;
 
@@ -43,6 +36,24 @@ class RiskManager extends EventEmitter {
 
     // Listen for trade events
     this._setupEventListeners();
+  }
+
+  // ---- Config-backed limits (read at call time) ----
+  get initialCapital() { return config.get('trading.initialCapital'); }
+  get maxRiskPerTrade() { return config.get('trading.maxRiskPerTrade'); }
+  get maxDailyLoss() { return config.get('trading.maxDailyLoss'); }
+  get maxOpenTrades() { return config.get('trading.maxOpenTrades'); }
+  get defaultStopLoss() { return config.get('trading.defaultStopLoss'); }
+  get defaultTarget() { return config.get('trading.defaultTarget'); }
+
+  /**
+   * Seed capital/peak on first use so that config.set() after import is seen.
+   */
+  _ensureCapital() {
+    if (this.currentCapital === null) {
+      this.currentCapital = this.initialCapital;
+      this.peakCapital = this.currentCapital;
+    }
   }
 
   /**
@@ -62,12 +73,29 @@ class RiskManager extends EventEmitter {
    * Check if a trade signal should be approved
    */
   checkSignal(signal, currentPositions = []) {
+    this._ensureCapital();
+
     const checks = {
       passed: true,
       reason: null,
       positionSize: 0,
       riskAmount: 0,
+      isExit: false,
     };
+
+    // Exit / reduction signals must always be allowed - even when blocked,
+    // because closing out is exactly what we want in a risk-limit scenario.
+    const existingPosition = currentPositions.find(p => p.symbol === signal.symbol);
+    if (existingPosition && existingPosition.side !== signal.action) {
+      checks.isExit = true;
+      checks.positionSize = existingPosition.quantity;
+      logger.debug('Risk check: exit signal allowed', {
+        symbol: signal.symbol,
+        action: signal.action,
+        positionSize: checks.positionSize,
+      });
+      return checks;
+    }
 
     // Check if trading is blocked
     if (this.isTradingBlocked) {
@@ -81,7 +109,7 @@ class RiskManager extends EventEmitter {
     const dailyLossPercent = Math.abs(Math.min(0, this.dailyPnL)) / this.initialCapital;
     if (dailyLossPercent >= this.maxDailyLoss) {
       checks.passed = false;
-      checks.reason = `Daily loss limit reached: ${dailyLossPercent.toFixed(2)}% / ${this.maxDailyLoss * 100}%`;
+      checks.reason = `Daily loss limit reached: ${(dailyLossPercent * 100).toFixed(2)}% / ${this.maxDailyLoss * 100}%`;
       this._logRejection(signal, checks.reason);
       return checks;
     }
@@ -94,8 +122,8 @@ class RiskManager extends EventEmitter {
       return checks;
     }
 
-    // Check if we already have a position in this symbol
-    const existingPosition = currentPositions.find(p => p.symbol === signal.symbol);
+    // Already holding this symbol and the signal would ADD to it (exits
+    // were allowed above).
     if (existingPosition) {
       checks.passed = false;
       checks.reason = `Already have position in ${signal.symbol}`;
@@ -166,16 +194,7 @@ class RiskManager extends EventEmitter {
    * Handle trade filled event
    */
   _onTradeFilled(trade) {
-    this.openTrades.push({
-      id: trade.id,
-      symbol: trade.symbol,
-      side: trade.side,
-      quantity: trade.quantity,
-      entryPrice: trade.entryPrice,
-      entryTime: trade.timestamp,
-      strategy: trade.strategy,
-    });
-
+    this._ensureCapital();
     this.dailyTrades++;
     logger.info('Trade opened', {
       id: trade.id,
@@ -187,11 +206,11 @@ class RiskManager extends EventEmitter {
   }
 
   /**
-   * Handle position closed event
+   * Handle position closed event. The order manager is the single source of
+   * truth for positions, so this only settles PnL / drawdown state here.
    */
   _onPositionClosed(result) {
-    // Remove from open trades
-    this.openTrades = this.openTrades.filter(t => t.id !== result.tradeId);
+    this._ensureCapital();
 
     // Update PnL
     this.dailyPnL += result.pnl;
@@ -252,55 +271,32 @@ class RiskManager extends EventEmitter {
   }
 
   /**
-   * Close a specific trade (for stop loss / target hits)
+   * Get current risk exposure from the order manager's live positions.
+   * The risk manager no longer keeps its own position ledger.
+   * @param {Array} currentPositions - positions owned by the order manager
    */
-  closeTrade(tradeId, exitPrice) {
-    const trade = this.openTrades.find(t => t.id === tradeId);
-    if (!trade) {
-      logger.warn('Trade not found for closing', { tradeId });
-      return null;
-    }
-
-    // Calculate PnL
-    let pnl;
-    if (trade.side === 'BUY') {
-      pnl = (exitPrice - trade.entryPrice) * trade.quantity;
-    } else {
-      pnl = (trade.entryPrice - exitPrice) * trade.quantity;
-    }
-
-    // Emit position closed event
-    eventBus.emitSafe('position_closed', {
-      tradeId,
-      symbol: trade.symbol,
-      side: trade.side,
-      quantity: trade.quantity,
-      entryPrice: trade.entryPrice,
-      exitPrice,
-      pnl,
-    });
-
-    return { tradeId, pnl, exitPrice };
-  }
-
-  /**
-   * Get current risk exposure
-   */
-  getExposure() {
-    const totalValue = this.openTrades.reduce((sum, t) => sum + t.quantity * t.entryPrice, 0);
+  getExposure(currentPositions = []) {
+    this._ensureCapital();
+    const totalValue = currentPositions.reduce(
+      (sum, t) => sum + t.quantity * (t.avgPrice ?? t.entryPrice ?? 0),
+      0
+    );
+    const availableCapital = this.currentCapital;
     return {
-      openTrades: this.openTrades.length,
+      openTrades: currentPositions.length,
       totalValue,
       capitalUsed: totalValue,
-      availableCapital: this.currentCapital,
-      exposurePercent: totalValue / this.currentCapital,
+      availableCapital,
+      exposurePercent: availableCapital > 0 ? totalValue / availableCapital : 0,
     };
   }
 
   /**
    * Get risk statistics
+   * @param {Array} currentPositions - positions owned by the order manager
    */
-  getStats() {
+  getStats(currentPositions = []) {
+    this._ensureCapital();
     return {
       initialCapital: this.initialCapital,
       currentCapital: this.currentCapital,
@@ -308,7 +304,7 @@ class RiskManager extends EventEmitter {
       totalPnLPercent: (this.totalPnL / this.initialCapital) * 100,
       dailyPnL: this.dailyPnL,
       dailyTrades: this.dailyTrades,
-      openTrades: this.openTrades.length,
+      openTrades: currentPositions.length,
       maxOpenTrades: this.maxOpenTrades,
       currentDrawdown: this.currentDrawdown * 100,
       maxDrawdown: this.maxDrawdown * 100,
@@ -322,6 +318,7 @@ class RiskManager extends EventEmitter {
    * Update capital (for deposits/withdrawals)
    */
   updateCapital(amount) {
+    this._ensureCapital();
     this.currentCapital += amount;
     logger.info('Capital updated', {
       change: amount,

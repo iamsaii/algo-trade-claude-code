@@ -19,6 +19,7 @@ import { eventBus } from '../src/core/eventBus.js';
 import aiGate from '../src/ai/aiGate.js';
 import { TradeRepository } from '../src/storage/tradeRepository.js';
 import aiJournal from '../src/ai/journal.js';
+import quotes from '../src/ai/quotes.js';
 
 let passed = 0;
 let failed = 0;
@@ -471,6 +472,34 @@ test('journal appends readable entries per day', () => {
   assert(text.includes('[DECISION]') && text.includes('TCS'), 'decision line present');
   assert(text.includes('[REJECTED]') && text.includes('max trades'), 'rejection line present');
   assert(/^- \d{2}:\d{2} \[DECISION\]/m.test(text), 'timestamped line format');
+});
+
+// Quote provider
+logger.info('\n=== Testing Quote Provider ===\n');
+
+test('quotes falls back to yfinance when kite is unavailable', async () => {
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    return {
+      ok: true,
+      json: async () => ({
+        quoteResponse: { result: [
+          { symbol: 'TCS.NS', regularMarketPrice: 405.5, regularMarketPreviousClose: 400 },
+        ] },
+      }),
+    };
+  };
+  const r = await quotes.getQuotes(['TCS'], { kiteBroker: null, fetchFn });
+  assert(calls.some(u => u.includes('TCS.NS')), 'yahoo endpoint called with .NS suffix');
+  assert(r.TCS.ltp === 405.5 && r.TCS.prevClose === 400, 'mapped to base symbol');
+  assert(Math.abs(r.TCS.changePct - 1.375) < 1e-9, 'changePct computed');
+});
+
+test('quotes omits symbols that fail everywhere', async () => {
+  const fetchFn = async () => ({ ok: false, status: 401, json: async () => ({}) });
+  const r = await quotes.getQuotes(['TCS'], { kiteBroker: null, fetchFn });
+  assert(!r.TCS, 'failed symbol omitted');
 });
 
 // Summary

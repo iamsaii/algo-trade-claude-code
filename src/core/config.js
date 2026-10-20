@@ -105,6 +105,21 @@ const defaultConfig = {
     endDate: '2024-12-31',
     initialCapital: 100000,
   },
+
+  // AI trading agent settings
+  ai: {
+    dailyBudget: 1000,            // Gross rupees the agent may spend per day (resets 09:15)
+    maxTrades: 2,                 // Max new AI trades per day
+    dailyLossLimitPct: 0.05,      // Halt for the day beyond 5% of budget lost
+    misLeverage: 5,               // Intraday margin multiplier for qty math
+    eodExitEnabled: true,         // Square off all AI lots at end of day
+    eodExitTime: '15:15',
+    llm: {
+      provider: 'gemini',
+      model: 'gemini-2.0-flash',
+    },
+    tag: 'ai-agent',              // Kite order tag AND strategy value
+  },
 };
 
 // Environment-specific overrides

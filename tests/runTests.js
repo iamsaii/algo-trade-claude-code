@@ -380,6 +380,18 @@ test('async value is set once awaited', () => {
   assert(asyncValue === 42, `expected 42, got ${asyncValue}`);
 });
 
+// AI agent config
+logger.info('\n=== Testing AI Agent Config ===\n');
+
+test('ai config block has defaults and is settable', () => {
+  assert(config.get('ai.dailyBudget') === 1000, 'default budget');
+  assert(config.get('ai.maxTrades') === 2, 'default maxTrades');
+  assert(config.get('ai.llm.model') === 'gemini-2.0-flash', 'default model');
+  config.set('ai.dailyBudget', 5000);
+  assert(config.get('ai.dailyBudget') === 5000, 'settable');
+  config.set('ai.dailyBudget', 1000); // restore for other tests
+});
+
 // Summary
 (async () => {
   for (const { name, fn } of pendingTests) {

@@ -10,10 +10,15 @@ import fs from 'fs';
 import logger from '../utils/logger.js';
 import config from '../core/config.js';
 
+/** Local calendar date YYYY-MM-DD — the one definition of "today". */
+export function todayStr() {
+  return new Date().toLocaleDateString('sv');
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-class TradeRepository {
+export class TradeRepository {
   constructor(dbPath = null) {
     this.dbPath = dbPath || config.get('database.path');
 
@@ -120,6 +125,23 @@ class TradeRepository {
         unrealized_pnl REAL DEFAULT 0,
         total_value REAL NOT NULL,
         positions_count INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s', 'now'))
+      )
+    `);
+
+    // AI agent ledger: the sell-guard source of truth. The agent may
+    // only ever sell what it has bought and recorded here.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS ai_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        price REAL NOT NULL,
+        product TEXT,
+        kite_order_id TEXT,
+        reason TEXT,
+        day TEXT NOT NULL,
         created_at INTEGER DEFAULT (strftime('%s', 'now'))
       )
     `);
@@ -472,6 +494,70 @@ class TradeRepository {
       logger.error('Failed to save portfolio snapshot', { error: error.message });
       return false;
     }
+  }
+
+  /**
+   * Record an AI agent fill (buy or sell) in the agent's own ledger.
+   * Thrown errors must propagate: an unrecorded fill would break the
+   * sell-guard, so the caller must never continue past this silently.
+   */
+  recordAiFill({ symbol, side, quantity, price, product = null, kiteOrderId = null, reason = null }) {
+    const stmt = this.db.prepare(`
+      INSERT INTO ai_ledger (symbol, side, quantity, price, product, kite_order_id, reason, day)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const info = stmt.run(symbol, side, quantity, price, product, kiteOrderId, reason, todayStr());
+    return info.lastInsertRowid;
+  }
+
+  /**
+   * Margin rupees consumed today: buys count quantity*price/leverage
+   * (MIS leveraged, CNC full); sale proceeds never refill the budget.
+   */
+  getSpendToday() {
+    const misLeverage = config.get('ai.misLeverage');
+    const rows = this.db.prepare(
+      "SELECT quantity, price, product FROM ai_ledger WHERE day = ? AND side = 'BUY'"
+    ).all(todayStr());
+    return rows.reduce((sum, r) => {
+      const leverage = r.product === 'MIS' ? misLeverage : 1;
+      return sum + (r.quantity * r.price) / leverage;
+    }, 0);
+  }
+
+  /**
+   * Net open AI lots (buys minus sells, positive quantities only).
+   */
+  getOpenAiLots() {
+    const rows = this.db.prepare(`
+      SELECT symbol, SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS qty
+      FROM ai_ledger
+      GROUP BY symbol
+      HAVING qty > 0
+    `).all();
+    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty }));
+  }
+
+  /**
+   * Open lot for one symbol with weighted-average buy price, or null.
+   */
+  getOpenAiLot(symbol) {
+    const rows = this.db.prepare(
+      'SELECT side, quantity, price FROM ai_ledger WHERE symbol = ?'
+    ).all(symbol);
+    if (!rows.length) return null;
+    let qty = 0;
+    let buyQty = 0;
+    let buyAmount = 0;
+    for (const r of rows) {
+      if (r.side === 'BUY') {
+        buyQty += r.quantity;
+        buyAmount += r.quantity * r.price;
+      }
+      qty += r.side === 'BUY' ? r.quantity : -r.quantity;
+    }
+    if (qty <= 0) return null;
+    return { symbol, quantity: qty, avgPrice: buyQty > 0 ? buyAmount / buyQty : 0 };
   }
 
   /**

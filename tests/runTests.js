@@ -17,6 +17,7 @@ import PositionMonitor from '../src/execution/positionMonitor.js';
 import config from '../src/core/config.js';
 import { eventBus } from '../src/core/eventBus.js';
 import aiGate from '../src/ai/aiGate.js';
+import { TradeRepository } from '../src/storage/tradeRepository.js';
 
 let passed = 0;
 let failed = 0;
@@ -438,6 +439,23 @@ test('aiGate blocks duplicate symbols and stays within remaining budget', () => 
   assert(r.accepted.length === 0 && /already holding/.test(r.rejected[0].reason), 'duplicate rejected');
   const r2 = aiGate.validateDecisions({ decisions: [d], quotes, spentToday: 900, openLots: [] });
   assert(r2.accepted.length === 0 && /budget/.test(r2.rejected[0].reason), 'budget left 100 < 300');
+});
+
+// AI ledger
+logger.info('\n=== Testing AI Ledger ===\n');
+
+test('ai ledger tracks margin spend, open lots, and sell-guard quantities', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 12, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai' });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 5, price: 410, product: 'MIS', kiteOrderId: 'k2', reason: 'stop' });
+  // margin semantics: 12 * 400 / 5 (MIS leverage) = 960; sale proceeds never refill
+  assert(repo.getSpendToday() === 960, `margin spend should be 960, got ${repo.getSpendToday()}`);
+  const lots = repo.getOpenAiLots();
+  assert(lots.length === 1 && lots[0].quantity === 7, `open lot qty 7, got ${JSON.stringify(lots)}`);
+  const one = repo.getOpenAiLot('TCS');
+  assert(one && one.quantity === 7, 'per-symbol lot');
+  assert(repo.getOpenAiLot('INFY') === null, 'unknown symbol -> null');
 });
 
 // Summary

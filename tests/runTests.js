@@ -22,6 +22,8 @@ import aiJournal from '../src/ai/journal.js';
 import quotes from '../src/ai/quotes.js';
 import marketBrief from '../src/ai/marketBrief.js';
 import llmAdvisor from '../src/ai/llmAdvisor.js';
+import totp from '../src/ai/totp.js';
+import KiteBroker from '../src/brokers/kiteBroker.js';
 
 let passed = 0;
 let failed = 0;
@@ -531,6 +533,31 @@ test('askAdvisor returns empty on repeated failure, never throws', async () => {
   const fetchFn = async () => ({ ok: false, status: 429, json: async () => ({}) });
   const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
   assert(Array.isArray(d) && d.length === 0, 'quota failure -> no decisions');
+});
+
+// Kite plumbing
+logger.info('\n=== Testing Kite Plumbing ===\n');
+
+test('totp generates RFC 6238 test vector codes', () => {
+  const code = totp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 1111111109);
+  assert(code === '07081804', `RFC vector 8-digit, got ${code}`);
+});
+
+test('totp 6-digit variant for kite login', () => {
+  const code = totp('GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ', 1111111109, 6);
+  assert(code === '081804', `6-digit truncation, got ${code}`);
+});
+
+test('KiteBroker normalizes kite net positions', async () => {
+  const kb = new KiteBroker({});
+  kb.connected = true;
+  kb.kite = { async getPositions() { return { net: [
+    { tradingsymbol: 'TCS', quantity: 10, avg_price: 400, ltp: 405 },
+    { tradingsymbol: 'INFY', quantity: 0, avg_price: 0, ltp: 0 },
+  ] }; } };
+  const list = await kb.getPositions();
+  assert(list.length === 1, `flat rows omitted, got ${list.length}`);
+  assert(list[0].symbol === 'TCS' && list[0].unrealizedPnL === 50, `normalized: ${JSON.stringify(list[0])}`);
 });
 
 // Summary

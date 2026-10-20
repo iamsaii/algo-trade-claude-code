@@ -9,3 +9,4 @@ data/*.db-shm
 # OpenCode skill-installation artifacts (regenerable, not app code)
 .agents/
 skills-lock.json
+data/.kite_token.json

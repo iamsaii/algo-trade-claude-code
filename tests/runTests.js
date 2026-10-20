@@ -531,10 +531,10 @@ test('askAdvisor parses decisions and normalizes keys', async () => {
   assert(d.length === 1 && d[0].symbol === 'TCS' && d[0].stopLoss === 390, 'parsed and normalized');
 });
 
-test('askAdvisor returns empty on repeated failure, never throws', async () => {
+test('askAdvisor returns null on repeated failure, never throws', async () => {
   const fetchFn = async () => ({ ok: false, status: 429, json: async () => ({}) });
   const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
-  assert(Array.isArray(d) && d.length === 0, 'quota failure -> no decisions');
+  assert(d === null, 'quota failure -> null (runner journals llm-error, distinct from a stand-down)');
 });
 
 // Kite plumbing
@@ -653,11 +653,11 @@ test('runEod squares off open ai lots and is idempotent', async () => {
   const stub = { name: 'stub', async isConnected() { return true; },
     async placeOrder(o) { sells.push(o); return { success: true, fillPrice: 410, quantity: o.quantity, orderId: 'e1', action: 'CLOSE', realizedPnL: 120, closedQuantity: o.quantity }; } };
   const repo = tempRepoWithBuy('TCS', 12, 400);
-  const r = await aiRunner.runEod({ broker: stub, repo, journal: aiJournal });
+  const r = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo, journal: aiJournal });
   assert(sells.length === 1 && sells[0].side === 'SELL' && sells[0].quantity === 12, `sold 12 TCS, got ${JSON.stringify(sells)}`);
   assert(repo.getOpenAiLots().length === 0, 'ledger flat');
   assert(r.closed.length === 1 && r.closed[0].pnl === 120, `realized pnl journaled, got ${JSON.stringify(r.closed)}`);
-  const r2 = await aiRunner.runEod({ broker: stub, repo, journal: aiJournal });
+  const r2 = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo, journal: aiJournal });
   assert(r2.closed.length === 0, 'second run is a no-op');
 });
 
@@ -670,10 +670,82 @@ test('runEod keeps CNC lots overnight when eodExitEnabled is false', async () =>
   const sells = [];
   const stub = { async isConnected() { return true; },
     async placeOrder(o) { sells.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'e2', action: 'CLOSE', realizedPnL: 0, closedQuantity: o.quantity }; } };
-  await aiRunner.runEod({ broker: stub, repo });
+  await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(405, 400), repo });
   assert(sells.length === 1 && sells[0].symbol === 'TCS', `MIS closed only, got ${JSON.stringify(sells)}`);
   assert(repo.getOpenAiLots().length === 1, 'CNC lot held overnight');
   config.set('ai.eodExitEnabled', true);
+});
+
+// Final review fix pass
+logger.info('\n=== Testing Review Fixes ===\n');
+
+test('gate rejects stops at or above the current market price', () => {
+  const { rejected } = aiGate.validateDecisions({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 405, stopLoss: 402, target: 420, confidence: 0.8 }],
+    quotes: { TCS: { ltp: 400, prevClose: 395 } },
+    spentToday: 0,
+    openLots: [],
+  });
+  assert(rejected.length === 1 && /below current market/.test(rejected[0].reason), `instant-stop rejected, got ${rejected[0]?.reason}`);
+});
+
+test('gate counts open lots against maxTrades', () => {
+  const { accepted, rejected } = aiGate.validateDecisions({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8 }],
+    quotes: { TCS: { ltp: 400, prevClose: 395 } },
+    spentToday: 0,
+    openLots: [{ symbol: 'INFY', quantity: 1 }, { symbol: 'HDFCBANK', quantity: 1 }],
+  });
+  assert(accepted.length === 0 && rejected.length === 1 && /max trades/.test(rejected[0].reason), `held lots consume the daily cap, got ${rejected[0]?.reason}`);
+});
+
+test('runDecide journals and skips when the LLM call fails', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  const r = await aiRunner.runDecide({
+    broker: { async isConnected() { return true; } },
+    fetchFn: yahooFetch(400, 395),
+    askFn: async () => null,
+    repo,
+  });
+  assert(r.skipped && /LLM/i.test(r.skipped), `llm failure skips, got ${r.skipped}`);
+  assert(aiJournal.read(new Date().toLocaleDateString('sv')).includes('llm-error'), 'journaled llm-error');
+});
+
+test('checkStops still enforces exits while the halt file is present', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 5, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  fs.writeFileSync('data/TRADING_HALTED', '');
+  const sold = [];
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { sold.push(o); return { success: true, fillPrice: o.entryPrice, quantity: o.quantity, orderId: 'k88', action: 'CLOSE', realizedPnL: -25, closedQuantity: o.quantity }; } };
+  const r = await aiRunner.checkStops({ broker: stub, fetchFn: yahooFetch(385, 400), repo });
+  fs.unlinkSync('data/TRADING_HALTED');
+  assert(r.exited.length === 1 && sold.length === 1, 'halt never disables stop enforcement');
+});
+
+test('runEod prices exits at the market quote when the broker returns no fill price', async () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 12, price: 400, product: 'MIS', kiteOrderId: 'k1', reason: 'ai', stopLoss: 390 });
+  const stub = { async isConnected() { return true; },
+    async placeOrder(o) { return { success: true, quantity: o.quantity, orderId: 'e9' }; } }; // live-style: no fillPrice
+  const r = await aiRunner.runEod({ broker: stub, fetchFn: yahooFetch(410, 400), repo });
+  assert(r.closed.length === 1 && r.closed[0].pnl === 120, `pnl from market price, got ${JSON.stringify(r.closed)}`);
+  assert(repo.getRealizedToday() === 120, 'ledger records the real sell price');
+});
+
+test('realized PnL and open-lot averages use FIFO, not all-time averages', () => {
+  const repo = new TradeRepository(':memory:');
+  repo.connect();
+  repo.db.prepare("INSERT INTO ai_ledger (symbol, side, quantity, price, product, day, stop_loss) VALUES ('TCS','BUY',10,400,'MIS','2026-01-01',390)").run();
+  repo.recordAiFill({ symbol: 'TCS', side: 'BUY', quantity: 10, price: 500, product: 'MIS', kiteOrderId: 'k2', reason: 'ai', stopLoss: 485 });
+  repo.recordAiFill({ symbol: 'TCS', side: 'SELL', quantity: 10, price: 480, product: 'MIS', kiteOrderId: 'k3', reason: 'stop' });
+  assert(repo.getRealizedToday() === 800, `today's sell matched the old 400 lot (+800), got ${repo.getRealizedToday()}`);
+  assert(repo.getOpenAiLots()[0].avgPrice === 500, `remaining lot avg is 500, got ${repo.getOpenAiLots()[0].avgPrice}`);
+  const exits = repo.getRecentExits(5);
+  assert(exits.length === 1 && exits[0].pnl === 800 && exits[0].exitReason === 'stop', `recent exits carry pnl for the LLM brief, got ${JSON.stringify(exits)}`);
 });
 
 // Summary

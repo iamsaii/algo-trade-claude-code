@@ -1,9 +1,10 @@
 /**
  * LLM Advisor
  * One Gemini REST call per trading day (free tier, native fetch — no
- * SDK). Returns normalized decision data or an empty array; it never
- * throws and never retries more than once, so a quota wall just means
- * "no trades today".
+ * SDK). Returns normalized decision data, an empty array for a legit
+ * stand-down, or null when the call itself failed (quota/503/bad
+ * JSON) — the runner journals null distinctly in the audit trail. It
+ * never throws and never retries more than once.
  */
 
 import logger from '../utils/logger.js';
@@ -48,12 +49,12 @@ function userMessage(brief) {
  * @param {string} opts.apiKey
  * @param {string} opts.model
  * @param {Function} opts.fetchFn  Injectable fetch for tests
- * @returns {Promise<Array>} normalized decisions; [] on any failure
+ * @returns {Promise<Array|null>} normalized decisions; [] for a stand-down; null on any failure
  */
 async function askAdvisor(brief, { apiKey, model, fetchFn = fetch } = {}) {
   if (!apiKey) {
     logger.warn('LLM advisor: no API key set, standing down (no trades)');
-    return [];
+    return null;
   }
 
   const url = `${ENDPOINT}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -93,7 +94,7 @@ async function askAdvisor(brief, { apiKey, model, fetchFn = fetch } = {}) {
   }
 
   logger.warn('LLM advisor standing down after retries — no trades this run');
-  return [];
+  return null;
 }
 
 export { askAdvisor, normalizeDecision };

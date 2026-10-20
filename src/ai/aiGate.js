@@ -28,7 +28,10 @@ function validateDecisions({ decisions = [], quotes = {}, spentToday = 0, openLo
   const rejected = [];
   const heldSymbols = new Set((openLots || []).map(l => l.symbol));
   let marginUsed = Number(spentToday) || 0;
-  let evaluated = 0; // structurally-valid decisions evaluated so far
+  // Structurally-valid decisions evaluated so far, seeded with the lots
+  // already held: overnight CNC lots and same-day re-runs consume the
+  // daily cap too — the cap is "trades per day", not "per process".
+  let evaluated = (openLots || []).length;
 
   for (const d of decisions || []) {
     const reject = (reason) => { rejected.push({ decision: d, reason }); };
@@ -52,6 +55,12 @@ function validateDecisions({ decisions = [], quotes = {}, spentToday = 0, openLo
     }
     if (typeof d.stopLoss !== 'number' || !(d.stopLoss < d.entry)) {
       reject('stop-loss must be below entry');
+      continue;
+    }
+    // An SL at or above the live price is already triggered: the buy
+    // would fill and stop out instantly — a guaranteed loss.
+    if (typeof d.stopLoss !== 'number' || !(d.stopLoss < quote.ltp)) {
+      reject('stop-loss must be below current market price');
       continue;
     }
     if (typeof d.target !== 'number' || !(d.target > d.entry)) {

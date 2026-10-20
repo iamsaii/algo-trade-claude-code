@@ -535,39 +535,86 @@ export class TradeRepository {
   }
 
   /**
-   * Net open AI lots (buys minus sells, positive quantities only).
-   * stopLoss = lowest buy stop, product = last buy's product (the gate
-   * blocks same-symbol re-buys while a lot is open, so both are
-   * unambiguous in practice).
+   * FIFO walk of the whole AI ledger per symbol: each sell is matched
+   * to the oldest unmatched buys, so prior-day lots never pollute
+   * today's realized P&L or an open lot's average price. Returns
+   * { open: Map<symbol, {quantity, avgPrice, stopLoss, product}>,
+   *   sells: [{symbol, quantity, day, pnl, reason}] } in rowid order.
    */
-  getOpenAiLots() {
-    const rows = this.db.prepare(`
-      SELECT symbol,
-             SUM(CASE WHEN side = 'BUY' THEN quantity ELSE -quantity END) AS qty,
-             MIN(stop_loss) AS stop_loss,
-             MAX(product) AS product,
-             (SELECT SUM(b.price * b.quantity) * 1.0 / SUM(b.quantity)
-                FROM ai_ledger b WHERE b.symbol = l.symbol AND b.side = 'BUY') AS avg_price
-      FROM ai_ledger l
-      GROUP BY symbol
-      HAVING qty > 0
-    `).all();
-    return rows.map(r => ({ symbol: r.symbol, quantity: r.qty, stopLoss: r.stop_loss, product: r.product, avgPrice: r.avg_price }));
+  _fifoWalk() {
+    const rows = this.db.prepare(
+      'SELECT symbol, side, quantity, price, product, stop_loss, reason, day FROM ai_ledger ORDER BY rowid'
+    ).all();
+    const queues = new Map(); // symbol -> unmatched buy lots [{qty, price, stopLoss, product}]
+    const sells = [];
+    for (const r of rows) {
+      let q = queues.get(r.symbol);
+      if (!q) { q = []; queues.set(r.symbol, q); }
+      if (r.side === 'BUY') {
+        q.push({ qty: r.quantity, price: r.price, stopLoss: r.stop_loss, product: r.product });
+        continue;
+      }
+      let remaining = r.quantity;
+      let pnl = 0;
+      while (remaining > 0 && q.length) {
+        const lot = q[0];
+        const take = Math.min(lot.qty, remaining);
+        pnl += (r.price - lot.price) * take;
+        lot.qty -= take;
+        remaining -= take;
+        if (lot.qty === 0) q.shift();
+      }
+      // Unmatched remainder (sell without buys on record) contributes 0.
+      sells.push({ symbol: r.symbol, quantity: r.quantity, day: r.day, pnl, reason: r.reason });
+    }
+    const open = new Map();
+    for (const [symbol, q] of queues) {
+      const qty = q.reduce((s, l) => s + l.qty, 0);
+      if (qty <= 0) continue;
+      const amount = q.reduce((s, l) => s + l.qty * l.price, 0);
+      const stops = q.map(l => l.stopLoss).filter(v => typeof v === 'number');
+      open.set(symbol, {
+        quantity: qty,
+        avgPrice: amount / qty,
+        stopLoss: stops.length ? Math.min(...stops) : null,
+        product: q[q.length - 1].product,
+      });
+    }
+    return { open, sells };
   }
 
   /**
-   * Realized PnL from today's AI sells: (sell price - avg buy price)
-   * * quantity, summed. Sells without any buy on record contribute 0.
+   * Net open AI lots (FIFO-unmatched buys).
+   * stopLoss = lowest unmatched buy stop, product = last unmatched
+   * buy's product (the gate blocks same-symbol re-buys while a lot is
+   * open, so both are unambiguous in practice).
+   */
+  getOpenAiLots() {
+    return [...this._fifoWalk().open.entries()].map(([symbol, o]) => ({
+      symbol,
+      quantity: o.quantity,
+      stopLoss: o.stopLoss,
+      product: o.product,
+      avgPrice: o.avgPrice,
+    }));
+  }
+
+  /**
+   * Realized PnL from today's AI sells, FIFO-matched against the full
+   * ledger — today's kill switch never sees yesterday's trades.
    */
   getRealizedToday() {
-    const rows = this.db.prepare(`
-      SELECT s.price AS sellPrice, s.quantity,
-             (SELECT SUM(b.price * b.quantity) * 1.0 / SUM(b.quantity)
-                FROM ai_ledger b WHERE b.symbol = s.symbol AND b.side = 'BUY') AS avgBuy
-      FROM ai_ledger s
-      WHERE s.day = ? AND s.side = 'SELL'
-    `).all(todayStr());
-    return rows.reduce((sum, r) => sum + ((r.sellPrice - (r.avgBuy ?? r.sellPrice)) * r.quantity), 0);
+    return this._fifoWalk()
+      .sells.filter(s => s.day === todayStr())
+      .reduce((sum, s) => sum + s.pnl, 0);
+  }
+
+  /**
+   * Most recent AI exits with realized PnL, for the LLM brief's
+   * feedback loop. Newest last.
+   */
+  getRecentExits(n = 5) {
+    return this._fifoWalk().sells.slice(-n).map(s => ({ symbol: s.symbol, pnl: s.pnl, exitReason: s.reason }));
   }
 
   /**

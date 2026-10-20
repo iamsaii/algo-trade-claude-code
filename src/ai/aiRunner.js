@@ -73,9 +73,14 @@ async function runDecide({ broker, fetchFn = fetch, askFn = askAdvisor, repo = t
   const openLots = repo.getOpenAiLots();
   const q = await quotesProvider.getQuotes(symbols, { kiteBroker: broker, fetchFn });
 
-  // 5. One LLM call.
-  const brief = buildBrief({ quotes: q, symbols, budget, spentToday, openLots, recentTrades: [] });
+  // 5. One LLM call. null = the call itself failed (quota/503/bad
+  //    JSON) — journal it so a broken day is distinct from a stand-down.
+  const brief = buildBrief({ quotes: q, symbols, budget, spentToday, openLots, recentTrades: repo.getRecentExits(5) });
   const decisions = await askFn(brief, { apiKey: process.env.GEMINI_API_KEY, model: config.get('ai.llm.model'), fetchFn });
+  if (decisions === null) {
+    journal.append(todayStr(), { type: 'NOTE', data: { event: 'llm-error', detail: 'LLM call failed after retry — no trades this run' } });
+    return { placed: [], rejected: [], skipped: 'LLM call failed' };
+  }
 
   // 6. The gate — the LLM never touches quantities or the broker.
   const { accepted, rejected } = validateDecisions({ decisions, quotes: q, spentToday, openLots });
@@ -139,15 +144,12 @@ async function runDecide({ broker, fetchFn = fetch, askFn = askAdvisor, repo = t
 /**
  * Stop check (paper mode every 15 min; also the EOD backstop helper).
  * Sells open lots whose ltp touched their stored stop. Lots without a
- * stored stop are left to the EOD runner.
+ * stored stop are left to the EOD runner. The halt file never blocks
+ * exits — it stops new entries only, so positions stay protected.
  *
  * @returns {Promise<{checked: number, exited: Array, skipped: string|null}>}
  */
 async function checkStops({ broker, fetchFn = fetch, repo = tradeRepository } = {}) {
-  if (halted()) {
-    return { checked: 0, exited: [], skipped: 'TRADING_HALTED file present — kill switch engaged' };
-  }
-
   const lots = repo.getOpenAiLots().filter(l => typeof l.stopLoss === 'number');
   if (lots.length === 0) return { checked: 0, exited: [], skipped: null };
 
@@ -193,11 +195,13 @@ async function checkStops({ broker, fetchFn = fetch, repo = tradeRepository } = 
 /**
  * EOD square-off. Sells every open lot at market (MIS must always
  * close same-day; when ai.eodExitEnabled is false only MIS lots close
- * and CNC is held overnight). Idempotent: a flat ledger is a no-op.
+ * and CNC is held overnight). Exits are priced at the live quote so
+ * journaled P&L reflects reality, not the buy price. Idempotent: a
+ * flat ledger is a no-op. The halt file never blocks exits.
  *
  * @returns {Promise<{closed: Array, failed: Array}>}
  */
-async function runEod({ broker, repo = tradeRepository, journal: j = journal } = {}) {
+async function runEod({ broker, fetchFn = fetch, repo = tradeRepository, journal: j = journal } = {}) {
   const eodExitEnabled = config.get('ai.eodExitEnabled');
   const tag = config.get('ai.tag');
 
@@ -209,13 +213,19 @@ async function runEod({ broker, repo = tradeRepository, journal: j = journal } =
 
   const closed = [];
   const failed = [];
+  if (lots.length === 0) return { closed, failed };
+
+  const q = await quotesProvider.getQuotes(lots.map(l => l.symbol), { kiteBroker: broker, fetchFn });
+
   for (const lot of lots) {
+    const ltp = q[lot.symbol]?.ltp;
+    const refPrice = typeof ltp === 'number' ? ltp : lot.avgPrice;
     const result = await broker.placeOrder({
       id: `AI-EOD-${Date.now()}-${lot.symbol}`,
       symbol: lot.symbol,
       side: 'SELL',
       quantity: lot.quantity,
-      entryPrice: lot.avgPrice,
+      entryPrice: refPrice,
       strategy: tag,
       product: lot.product || 'MIS',
       orderType: 'MARKET',
@@ -226,7 +236,7 @@ async function runEod({ broker, repo = tradeRepository, journal: j = journal } =
       continue;
     }
     const soldQty = result.quantity ?? lot.quantity;
-    const sellPrice = result.fillPrice ?? lot.avgPrice;
+    const sellPrice = result.fillPrice ?? refPrice;
     repo.recordAiFill({
       symbol: lot.symbol,
       side: 'SELL',

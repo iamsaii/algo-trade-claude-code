@@ -124,29 +124,12 @@ async function initializeBroker(mode, { dryRun = false, live = false } = {}) {
     case 'check':
     case 'eod':
       if (live) {
-        // Double guard before real money: an explicit flag AND env var.
-        if (process.env.KITE_LIVE !== '1') {
-          logger.error('Refusing --live: set KITE_LIVE=1 to confirm real-money AI trading.');
-          process.exit(1);
-        }
-        if (!process.env.KITE_API_KEY) {
-          logger.error('AI live mode requires KITE_API_KEY (TOTP login also needs KITE_API_SECRET, KITE_USER_ID, KITE_PASSWORD, KITE_TOTP_SECRET). Aborting.');
-          process.exit(1);
-        }
-        app.broker = new KiteBroker({
-          apiKey: process.env.KITE_API_KEY,
-          apiSecret: process.env.KITE_API_SECRET,
-          accessToken: process.env.KITE_ACCESS_TOKEN,
-        });
-        const result = await app.broker.connect();
-        if (!result.success) {
-          if (result.requiresAuth && result.loginUrl) {
-            logger.error('Kite requires authentication. Open this URL to get an access token:', { loginUrl: result.loginUrl });
-          } else {
-            logger.error('Failed to connect to Kite for AI live mode', { reason: result.reason });
-          }
-          process.exit(1);
-        }
+        // Live execution is deliberately refused: broker-side fills
+        // (SL-M, partial LIMIT fills) are not yet reconciled into the
+        // ai_ledger, which risks phantom lots and duplicate sells.
+        // Paper mode is unaffected (fills are synchronous there).
+        logger.error('AI live trading is disabled: broker fills are not yet reconciled into the ledger (phantom-lot / duplicate-sell risk). Run paper mode — see docs/ai-agent-ops.md.');
+        process.exit(1);
       } else {
         app.broker = new PaperBroker(initialCapital);
         await app.broker.connect();

@@ -63,20 +63,30 @@ per morning). The model defaults to `gemini-2.0-flash` (`ai.llm.model` in
 
 ```bash
 npm run ai:decide   # morning decision run (paper broker by default)
-npm run ai:live     # same, against real Kite (requires KITE_LIVE=1)
+npm run ai:live     # currently REFUSED — see "Live status" below
 npm run ai:eod      # end-of-day square-off (MIS always; CNC if enabled)
 npm run ai:check    # stop-loss check (paper mode; every 15 min)
 ```
+
+## Live status: disabled
+
+`ai:live` refuses to run (exit 1) and always will until broker-side fills
+are reconciled into the `ai_ledger`. Why: in live mode Kite reports an
+accepted order, not a fill — and broker-side SL-M exits between runs are
+invisible to the ledger. Unreconciled, that means phantom lots, duplicate
+sells, and a daily-loss kill switch blind to the main live loss path. Paper
+mode fills synchronously and is unaffected, so every safety rail (gate,
+budget, stops, EOD, kill switches) is fully exercised in paper. Re-enabling
+live is a code change (order-status read-back + position reconciliation),
+not a configuration flip.
 
 ## First run (paper-first protocol)
 
 1. `npm install`
 2. Export `GEMINI_API_KEY` (paper needs nothing else).
-3. Smoke-test the plumbing with real Kite creds:
-   `KITE_API_KEY=... KITE_API_SECRET=... KITE_USER_ID=... KITE_PASSWORD=...
-   KITE_TOTP_SECRET=... npm run ai:live` once during market hours —
-   confirm login succeeds and orders would carry tag `ai-agent`.
-   (Or verify login alone with a token-generating dry step before any order.)
+3. (Was: a real-credential live smoke — now moot, `ai:live` is refused.
+   The TOTP login path is exercised by unit tests; a real-login smoke
+   returns with the live-reconciliation work.)
 4. Run **3–5 full paper days** with the cron below *without* `--live`.
    Audit each day against `logs/journal/YYYY-MM-DD.md` and `data/trading.db`:
    - every `[DECISION]` has a rationale and stays inside the budget;
@@ -84,8 +94,8 @@ npm run ai:check    # stop-loss check (paper mode; every 15 min)
    - stops were attached (or `[NOTE no-broker-stop]` only in paper mode);
    - `[EXIT]` rows show the square-off and P&L;
    - nothing was traded outside `market.symbols`.
-5. Only then switch: add `KITE_LIVE=1` to the environment and swap
-   `ai:decide` → `ai:live` in crontab. Start with a small `ai.dailyBudget`.
+5. Going live requires the reconciliation work above first — until then
+   the cron stays on `ai:decide` (paper).
 
 ## Cron (weekdays only, machine timezone should be Asia/Kolkata)
 
@@ -99,8 +109,10 @@ npm run ai:check    # stop-loss check (paper mode; every 15 min)
 - `ai:check` every 15 min enforces stops in paper mode (live has
   broker-side SL-M orders as well).
 - `ai:eod` at 15:15 squares off; after it, later `ai:check` runs are no-ops.
-- After EOD the ledger is flat — every command is idempotent, so a re-run or
-  a machine reboot mid-day never double-spends the budget or double-sells.
+- After EOD the paper ledger is flat — every command is idempotent, so a
+  re-run or a machine reboot mid-day never double-spends the budget or
+  double-sells (paper fills are synchronous; live is disabled for the
+  reconciliation reasons above).
 
 ## Kill switch
 
@@ -109,8 +121,9 @@ npm run ai:check    # stop-loss check (paper mode; every 15 min)
 - **Automatic daily halt:** realized losses ≥ `dailyBudget ×
   dailyLossLimitPct` stop trading for that day (journaled as
   `[NOTE daily-loss-limit]`).
-- **Broker-side:** every live fill gets an SL-M stop order at the broker, so
-  positions are protected even if this machine dies.
+- **Paper stops:** paper has no broker-side SL-M; the `ai:check` cron
+  enforces stops every 15 minutes and `ai:eod` is the end-of-day backstop.
+  (Broker-side SL-M returns with the live-reconciliation work.)
 
 ## Honest caveats
 

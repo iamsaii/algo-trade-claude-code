@@ -10,3 +10,4 @@ data/*.db-shm
 .agents/
 skills-lock.json
 data/.kite_token.json
+data/TRADING_HALTED

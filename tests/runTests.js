@@ -16,6 +16,7 @@ import OrderManager from '../src/execution/orderManager.js';
 import PositionMonitor from '../src/execution/positionMonitor.js';
 import config from '../src/core/config.js';
 import { eventBus } from '../src/core/eventBus.js';
+import aiGate from '../src/ai/aiGate.js';
 
 let passed = 0;
 let failed = 0;
@@ -390,6 +391,53 @@ test('ai config block has defaults and is settable', () => {
   config.set('ai.dailyBudget', 5000);
   assert(config.get('ai.dailyBudget') === 5000, 'settable');
   config.set('ai.dailyBudget', 1000); // restore for other tests
+});
+
+// AI gate
+logger.info('\n=== Testing AI Gate ===\n');
+
+test('aiGate rejects SELL and accepts a valid BUY with computed qty', () => {
+  const { validateDecisions } = aiGate;
+  const quotes = { TCS: { ltp: 400, prevClose: 395 } };
+  const r = validateDecisions({
+    decisions: [
+      { action: 'SELL', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'x' },
+      { action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'y' },
+    ],
+    quotes, spentToday: 0, openLots: [],
+  });
+  assert(r.rejected.length === 1 && /SELL/.test(r.rejected[0].reason), 'SELL rejected');
+  // budget 1000 * leverage 5 = 5000 -> floor(5000/400) = 12 shares
+  assert(r.accepted[0].quantity === 12, `qty should be 12, got ${r.accepted[0].quantity}`);
+  assert(Math.abs(r.accepted[0].spend - 4800) < 1e-9, 'spend = qty * ltp');
+});
+
+test('aiGate rejects bad SL, unknown symbol, budget blowout, and oversize qty', () => {
+  const quotes = { A: { ltp: 100, prevClose: 99 }, B: { ltp: 100000, prevClose: 99000 } };
+  const d = (over) => ({ action: 'BUY', symbol: 'A', product: 'CNC', entry: 100, stopLoss: 95, target: 110, confidence: 0.9, rationale: 'r', ...over });
+  const r = aiGate.validateDecisions({
+    decisions: [
+      d({ stopLoss: 105 }),                       // SL >= entry
+      d({ symbol: 'ZZZ' }),                       // unknown
+      d({}), d({}), d({}), d({}),                 // 6 valid -> exceeds maxTrades 2
+      d({ symbol: 'B', product: 'MIS' }),         // 1000*5/100000 = 0 shares
+    ],
+    quotes, spentToday: 950, openLots: [],
+  });
+  const reasons = r.rejected.map(x => x.reason).join('|');
+  assert(/stop-loss/.test(reasons), 'SL rule');
+  assert(/watchlist/.test(reasons), 'symbol rule');
+  assert(/max trades/.test(reasons), 'trade count rule');
+  assert(/afford/.test(reasons), 'min qty rule');
+});
+
+test('aiGate blocks duplicate symbols and stays within remaining budget', () => {
+  const quotes = { X: { ltp: 300, prevClose: 290 } };
+  const d = { action: 'BUY', symbol: 'X', product: 'CNC', entry: 300, stopLoss: 290, target: 320, confidence: 0.7, rationale: 'r' };
+  const r = aiGate.validateDecisions({ decisions: [d], quotes, spentToday: 0, openLots: [{ symbol: 'X', quantity: 2 }] });
+  assert(r.accepted.length === 0 && /already holding/.test(r.rejected[0].reason), 'duplicate rejected');
+  const r2 = aiGate.validateDecisions({ decisions: [d], quotes, spentToday: 900, openLots: [] });
+  assert(r2.accepted.length === 0 && /budget/.test(r2.rejected[0].reason), 'budget left 100 < 300');
 });
 
 // Summary

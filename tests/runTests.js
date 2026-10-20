@@ -20,6 +20,8 @@ import aiGate from '../src/ai/aiGate.js';
 import { TradeRepository } from '../src/storage/tradeRepository.js';
 import aiJournal from '../src/ai/journal.js';
 import quotes from '../src/ai/quotes.js';
+import marketBrief from '../src/ai/marketBrief.js';
+import llmAdvisor from '../src/ai/llmAdvisor.js';
 
 let passed = 0;
 let failed = 0;
@@ -500,6 +502,35 @@ test('quotes omits symbols that fail everywhere', async () => {
   const fetchFn = async () => ({ ok: false, status: 401, json: async () => ({}) });
   const r = await quotes.getQuotes(['TCS'], { kiteBroker: null, fetchFn });
   assert(!r.TCS, 'failed symbol omitted');
+});
+
+// Market brief + LLM advisor
+logger.info('\n=== Testing Market Brief + LLM Advisor ===\n');
+
+test('buildBrief assembles budget, market rows, and instructions', () => {
+  const brief = marketBrief.buildBrief({
+    quotes: { TCS: { ltp: 405, prevClose: 400, changePct: 1.25 } },
+    symbols: ['TCS'], budget: 1000, spentToday: 0,
+    openLots: [], recentTrades: [{ symbol: 'INFY', pnl: -40, exitReason: 'Stop Loss' }],
+  });
+  assert(brief.budget === 1000 && brief.market.length === 1, 'budget + market rows');
+  assert(/empty/.test(brief.instructions) && /stop-loss/i.test(brief.instructions), 'instructions present');
+  assert(/MIS/.test(brief.instructions), 'leverage explained');
+});
+
+test('askAdvisor parses decisions and normalizes keys', async () => {
+  const body = { candidates: [{ content: { parts: [{ text: JSON.stringify({
+    decisions: [{ action: 'BUY', symbol: 'TCS', product: 'MIS', entry: 400, stopLoss: 390, target: 420, confidence: 0.8, rationale: 'gap up' }],
+  }) }] } }] };
+  const fetchFn = async () => ({ ok: true, json: async () => body });
+  const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
+  assert(d.length === 1 && d[0].symbol === 'TCS' && d[0].stopLoss === 390, 'parsed and normalized');
+});
+
+test('askAdvisor returns empty on repeated failure, never throws', async () => {
+  const fetchFn = async () => ({ ok: false, status: 429, json: async () => ({}) });
+  const d = await llmAdvisor.askAdvisor({ date: 'x' }, { apiKey: 'k', model: 'm', fetchFn });
+  assert(Array.isArray(d) && d.length === 0, 'quota failure -> no decisions');
 });
 
 // Summary
